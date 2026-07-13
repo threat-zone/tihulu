@@ -7,9 +7,9 @@ A Windows TLS 1.2/1.3 key extractor that uses the Windows Debug API to intercept
 
 ## How does it work?
 
-Tihulu attaches to a target process as a debugger (or launches it as a child) and sets software breakpoints (INT3) on Winsock entry points — `connect`, `send`, `recv`, `WSASend`, `WSARecv`, and their variants. By intercepting both sides of every socket call, it reconstructs the raw TLS byte stream for each connection.
+Tihulu attaches to a target process as a debugger (or launches it as a child) and sets a software breakpoint (INT3) only on the Winsock connect entry points — `connect` and `WSAConnect`. When the target initiates a connection it is briefly frozen while Tihulu rewrites the destination `sockaddr` to point at a loopback listener it owns, recording the original `IP:PORT` and the randomly chosen proxy port. The target then transparently connects to this local relay, which pumps the raw TCP stream to and from the real server while teeing a copy of every byte to an in-process TLS parser. Because the relay never terminates TLS, the genuine session secrets are still derived inside the target's own memory — exactly where the scanners below look for them.
 
-The byte stream is fed to an in-process TLS parser that tracks the handshake, extracts the **ClientRandom**, **ServerRandom**, and negotiated **cipher suite**, and identifies when application-data records are available for trial decryption.
+The teed byte stream is fed to a TLS parser that tracks the handshake, extracts the **ClientRandom**, **ServerRandom**, and negotiated **cipher suite**, and identifies when application-data records are available for trial decryption. Connections whose first outbound bytes are not a TLS handshake are relayed verbatim and otherwise ignored.
 
 Once the handshake is complete, Tihulu attempts to recover the session secret using one of two strategies:
 
@@ -117,5 +117,5 @@ TLS 1.3 per-epoch traffic secrets (handshake + application) are extracted indepe
 * **Memory obfuscation** — A target can trivially evade secret extraction by XOR-masking keys while they are in memory, only unmasking them inside the crypto primitive. A single XOR pass would defeat both scanning strategies.
 * **Windows x86-64 only** — The CALL-probe scanner and context capture rely on the Microsoft x64 ABI and Windows Debug API; 32-bit processes are not supported.
 * **No kernel-mode TLS** — Traffic handled entirely in kernel mode (e.g., HTTP.sys with kernel TLS offload) is not intercepted.
-* **IOCP / overlapped I/O** — Completion ports (`GetQueuedCompletionStatus`, `WSAGetOverlappedResult`) are tracked, but exotic async I/O patterns outside standard Winsock may be missed.
+* **Connection-oriented sockets only** — Interception keys off `connect`/`WSAConnect`, so the TCP relay covers connected sockets. Connectionless datagram flows (`sendto`/`recvfrom` without a prior `connect`) are not proxied.
 

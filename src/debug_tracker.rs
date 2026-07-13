@@ -1,19 +1,29 @@
 //! Windows Debug API based connection tracker.
 //!
-//! Uses software breakpoints on Winsock functions to intercept network I/O,
-//! then feeds captured data to the TLS parser for key extraction.
+//! Rather than hooking the many Winsock read/write entry points, Tihulu now
+//! installs INT3 software breakpoints **only** on the initial TCP connect
+//! functions (`connect`, `WSAConnect`). At connect time the destination
+//! `sockaddr` is rewritten to a loopback listener owned by the local proxy
+//! relay (see [`crate::proxy`]); the target then dials our relay, which pumps
+//! the raw TCP stream to/from the real server and tees every byte to the TLS
+//! parser. This sidesteps all of the async / overlapped / IOCP race
+//! conditions that plagued the per-call read/write hooks.
 //!
 //! Key design points:
-//! - Function breakpoints (INT3) on connect/send/recv/closesocket/WSASend/WSARecv
-//! - Return-address breakpoints for recv/WSARecv to capture incoming data
-//! - Breakpoints are retried on each LOAD_DLL event until ws2_32 is mapped
-//! - DEBUG_ONLY_THIS_PROCESS avoids child-process handle confusion
+//! - Function breakpoints (INT3) on connect/WSAConnect only.
+//! - Captured bytes arrive over a channel from the relay threads and are fed
+//!   to the same TLS parser + CALL-probe / fallback secret search as before.
+//! - Breakpoints are retried on each LOAD_DLL event until ws2_32 is mapped.
+//! - CreateProcess-family hooks remain (optional) for `--trace-children`.
+//! - DEBUG_ONLY_THIS_PROCESS avoids child-process handle confusion.
 
 #![cfg(windows)]
 
 use std::collections::HashMap;
 use std::mem;
-use std::sync::atomic::AtomicBool;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 use windows::Win32::Foundation::*;
@@ -24,10 +34,15 @@ use windows::Win32::System::Memory::*;
 use windows::Win32::System::Threading::*;
 
 use crate::memory_reader::MemoryReader;
+use crate::proxy::{ProxyEvent, ProxyManager};
 use crate::tls_decrypt;
 use crate::tls_parser::{hex_string, TlsParser, TLS13_CHTS, TLS13_CTS0, TLS13_SHTS, TLS13_STS0, TLS13_ALL};
 use crate::tls_types::*;
 use crate::call_scanner::{self, ArgReg, CallScanner, Phase as ScanPhase};
+
+/// Monotonic id assigned to every redirected connection. Shared across all
+/// trackers so ids are globally unique even under `--trace-children`.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 macro_rules! dbg_log {
     ($self:expr, $($arg:tt)*) => {
@@ -110,18 +125,6 @@ extern "system" {
 struct HookAddresses {
     connect: u64,
     wsaconnect: u64,
-    send: u64,
-    recv: u64,
-    recvfrom: u64,
-    sendto: u64,
-    closesocket: u64,
-    wsasend: u64,
-    wsarecv: u64,
-    wsarecvfrom: u64,
-    wsasendto: u64,
-    gqcs: u64,
-    gqcs_ex: u64,
-    wsa_get_overlapped_result: u64,
     // Process-creation APIs — we hook these so we can also trace any child
     // process spawned by the target. Optional: zero means "not resolved".
     create_process_w: u64,
@@ -146,60 +149,11 @@ enum BreakpointKind {
     CallProbe,
 }
 
-/// Resolved buffer pointer + capacity from a WSABUF struct.
-#[derive(Clone)]
-struct ResolvedBuf {
-    ptr: u64,
-    len: usize,
-}
-
-/// Tracks a pending overlapped recv so IOCP completions can find the buffers.
-/// Buffer pointers are resolved eagerly at call time so they remain valid even
-/// if the original WSABUF array was stack-allocated and has since been freed.
-#[derive(Clone)]
-struct PendingOverlapped {
-    socket: u64,
-    bufs: Vec<ResolvedBuf>,
-}
-
+/// A function call whose return value/out-parameters we want to inspect via
+/// a one-shot return-address breakpoint. Only the process-creation paths
+/// still use this mechanism.
 #[derive(Clone)]
 enum PendingCall {
-    Recv {
-        socket: u64,
-        buf_ptr: u64,
-        max_len: usize,
-    },
-    RecvFrom {
-        socket: u64,
-        buf_ptr: u64,
-        max_len: usize,
-    },
-    WsaRecv {
-        socket: u64,
-        bufs: Vec<ResolvedBuf>,
-        bytes_received_ptr: u64,
-        overlapped_ptr: u64,
-    },
-    WsaRecvFrom {
-        socket: u64,
-        bufs: Vec<ResolvedBuf>,
-        bytes_received_ptr: u64,
-        overlapped_ptr: u64,
-    },
-    Gqcs {
-        bytes_transferred_ptr: u64,
-        completion_key_ptr: u64,
-        overlapped_ptr_ptr: u64,
-    },
-    GqcsEx {
-        entries_ptr: u64,
-        num_removed_ptr: u64,
-    },
-    WsaGetOverlappedResult {
-        socket: u64,
-        overlapped_ptr: u64,
-        transfer_ptr: u64,
-    },
     /// CreateProcess{A,W,AsUserW}. The 10th argument (lpProcessInformation)
     /// is filled in by the time the call returns; we read dwProcessId from
     /// it and spawn a child Tihulu instance to monitor the new process.
@@ -223,6 +177,16 @@ struct Breakpoint {
 struct ConnectionState {
     parser: TlsParser,
     process_handle: HANDLE,
+    /// Whether we have inspected the first outbound bytes to decide if this
+    /// connection is carrying TLS. Until then the connection is parsed
+    /// optimistically.
+    tls_checked: bool,
+    /// Set once the first outbound payload is confirmed to begin with a TLS
+    /// handshake record. Non-TLS connections are still relayed verbatim by
+    /// the proxy but no longer fed to the parser.
+    is_tls: bool,
+    /// Human-readable original destination (`IP:PORT`) for logging.
+    dest: String,
 }
 
 struct ThreadState {
@@ -249,9 +213,13 @@ pub struct DebugTracker {
     breakpoints: HashMap<u64, Breakpoint>,
     /// True once all function breakpoints are installed in the target.
     breakpoints_active: bool,
-    connections: HashMap<(u32, u64), ConnectionState>,
-    /// Pending overlapped recv operations, keyed by OVERLAPPED pointer address.
-    pending_overlapped: HashMap<u64, PendingOverlapped>,
+    /// Active relayed connections keyed by the proxy connection id.
+    connections: HashMap<u64, ConnectionState>,
+    /// Local TCP relay proxy: rewrites connect destinations to loopback and
+    /// pumps the raw stream to/from the real server.
+    proxy: ProxyManager,
+    /// Receiver drained by the event loop for relayed payload + close events.
+    proxy_rx: Receiver<ProxyEvent>,
     /// Recently consumed return-breakpoint addresses → original byte.
     /// Used to handle "ghost" breakpoints from other threads that hit the
     /// INT3 between write and consume on a different thread.
@@ -347,6 +315,7 @@ impl DebugTracker {
         if resume_on_attach {
             eprintln!("[*] Target was started suspended — will resume after hook install");
         }
+        let (proxy, proxy_rx) = ProxyManager::new(verbose);
         Self {
             process_handle: HANDLE::default(),
             pid,
@@ -354,7 +323,8 @@ impl DebugTracker {
             breakpoints: HashMap::new(),
             breakpoints_active: false,
             connections: HashMap::new(),
-            pending_overlapped: HashMap::new(),
+            proxy,
+            proxy_rx,
             consumed_return_addrs: HashMap::new(),
             threads: HashMap::new(),
             thread_handles: HashMap::new(),
@@ -790,7 +760,7 @@ impl DebugTracker {
     // Function breakpoint dispatch
     // ------------------------------------------------------------------
 
-    fn dispatch_function_bp(&mut self, pid: u32, tid: u32, addr: u64) {
+    fn dispatch_function_bp(&mut self, _pid: u32, tid: u32, addr: u64) {
         let addrs = match &self.hook_addrs {
             Some(a) => a,
             None => return,
@@ -806,43 +776,7 @@ impl DebugTracker {
 
         if addr == addrs.connect || addr == addrs.wsaconnect {
             dbg_log!(self, "[dbg] => connect/WSAConnect()");
-            self.on_connect(pid, &ctx);
-        } else if addr == addrs.send {
-            dbg_log!(self, "[dbg] => send() socket=0x{:X} len={}", ctx.rcx, ctx.r8);
-            self.on_send(pid, &ctx, Direction::Out);
-        } else if addr == addrs.sendto {
-            dbg_log!(self, "[dbg] => sendto() socket=0x{:X} len={}", ctx.rcx, ctx.r8);
-            self.on_send(pid, &ctx, Direction::Out);
-        } else if addr == addrs.recv {
-            dbg_log!(self, "[dbg] => recv() socket=0x{:X} maxlen={}", ctx.rcx, ctx.r8);
-            self.on_recv_entry(pid, tid, &ctx);
-        } else if addr == addrs.recvfrom {
-            dbg_log!(self, "[dbg] => recvfrom() socket=0x{:X} maxlen={}", ctx.rcx, ctx.r8);
-            self.on_recvfrom_entry(pid, tid, &ctx);
-        } else if addr == addrs.closesocket {
-            dbg_log!(self, "[dbg] => closesocket() socket=0x{:X}", ctx.rcx);
-            self.on_close(pid, &ctx);
-        } else if addr == addrs.wsasend {
-            dbg_log!(self, "[dbg] => WSASend() socket=0x{:X} bufcount={}", ctx.rcx, ctx.r8);
-            self.on_wsasend(pid, &ctx);
-        } else if addr == addrs.wsarecv {
-            dbg_log!(self, "[dbg] => WSARecv() socket=0x{:X} bufcount={}", ctx.rcx, ctx.r8);
-            self.on_wsarecv_entry(pid, tid, &ctx);
-        } else if addr == addrs.wsarecvfrom {
-            dbg_log!(self, "[dbg] => WSARecvFrom() socket=0x{:X} bufcount={}", ctx.rcx, ctx.r8);
-            self.on_wsarecvfrom_entry(pid, tid, &ctx);
-        } else if addr == addrs.wsasendto {
-            dbg_log!(self, "[dbg] => WSASendTo() socket=0x{:X} bufcount={}", ctx.rcx, ctx.r8);
-            self.on_wsasendto(pid, &ctx);
-        } else if addr == addrs.gqcs {
-            dbg_log!(self, "[dbg] => GetQueuedCompletionStatus()");
-            self.on_gqcs_entry(tid, &ctx);
-        } else if addr == addrs.gqcs_ex {
-            dbg_log!(self, "[dbg] => GetQueuedCompletionStatusEx()");
-            self.on_gqcs_ex_entry(tid, &ctx);
-        } else if addr == addrs.wsa_get_overlapped_result {
-            dbg_log!(self, "[dbg] => WSAGetOverlappedResult() socket=0x{:X}", ctx.rcx);
-            self.on_wsa_get_overlapped_result_entry(tid, &ctx);
+            self.on_connect(&ctx);
         } else if addrs.create_process_w != 0 && addr == addrs.create_process_w {
             dbg_log!(self, "[dbg] => CreateProcessW()");
             self.on_create_process_entry(tid, &ctx);
@@ -867,7 +801,7 @@ impl DebugTracker {
     // Return breakpoint dispatch
     // ------------------------------------------------------------------
 
-    fn dispatch_return_bp(&mut self, pid: u32, tid: u32, call: &PendingCall) {
+    fn dispatch_return_bp(&mut self, _pid: u32, tid: u32, call: &PendingCall) {
         let th = match self.thread_handles.get(&tid) {
             Some(&h) => h,
             None => return,
@@ -878,179 +812,6 @@ impl DebugTracker {
         };
 
         match call {
-            PendingCall::Recv {
-                socket,
-                buf_ptr,
-                max_len,
-            } | PendingCall::RecvFrom {
-                socket,
-                buf_ptr,
-                max_len,
-            } => {
-                // recv/recvfrom returns int: >0 = bytes, 0 = closed, <0 = error
-                let result = ctx.rax as i64;
-                dbg_log!(self, "[dbg] recv/recvfrom returned {} for socket 0x{:X}", result, socket);
-                if result <= 0 {
-                    return;
-                }
-                let to_read = (result as usize).min(*max_len);
-                let mut buf = vec![0u8; to_read];
-                if read_mem(self.process_handle, *buf_ptr, &mut buf) {
-                    self.process_data(pid, *socket, &buf, Direction::In);
-                }
-            }
-            PendingCall::WsaRecv {
-                socket,
-                bufs,
-                bytes_received_ptr,
-                overlapped_ptr,
-            } | PendingCall::WsaRecvFrom {
-                socket,
-                bufs,
-                bytes_received_ptr,
-                overlapped_ptr,
-            } => {
-                dbg_log!(self, "[dbg] WSARecv/WSARecvFrom returned 0x{:X} for socket 0x{:X}", ctx.rax, socket);
-                if ctx.rax == 0 {
-                    // Synchronous success — read the actual byte count from
-                    // lpNumberOfBytesRecvd (arg5) which was saved at call time.
-                    self.pending_overlapped.remove(overlapped_ptr);
-                    let bytes_received = if *bytes_received_ptr != 0 {
-                        let mut br = [0u8; 4];
-                        if read_mem(self.process_handle, *bytes_received_ptr, &mut br) {
-                            u32::from_le_bytes(br) as usize
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    };
-                    dbg_log!(self, "[dbg]   sync completion, {} bytes received", bytes_received);
-                    if bytes_received > 0 {
-                        self.read_resolved_bufs_and_process(pid, *socket, bufs, bytes_received);
-                    }
-                } else {
-                    // SOCKET_ERROR (-1) — likely WSA_IO_PENDING.
-                    // Data will arrive via IOCP; pending_overlapped is already stored.
-                    dbg_log!(self, "[dbg]   async pending, overlapped=0x{:X}", overlapped_ptr);
-                }
-            }
-            PendingCall::Gqcs {
-                bytes_transferred_ptr,
-                completion_key_ptr,
-                overlapped_ptr_ptr,
-            } => {
-                // GetQueuedCompletionStatus returns BOOL (non-zero = success)
-                if ctx.rax == 0 {
-                    dbg_log!(self, "[dbg] GQCS returned FALSE");
-                    return;
-                }
-                let mut ov_bytes = [0u8; 8];
-                if !read_mem(self.process_handle, *overlapped_ptr_ptr, &mut ov_bytes) {
-                    return;
-                }
-                let overlapped_addr = u64::from_le_bytes(ov_bytes);
-                let mut bt_bytes = [0u8; 4];
-                if !read_mem(self.process_handle, *bytes_transferred_ptr, &mut bt_bytes) {
-                    return;
-                }
-                let bytes_transferred = u32::from_le_bytes(bt_bytes) as usize;
-                // Read completion key (often the socket handle).
-                let completion_key = read_stack_u64(self.process_handle, *completion_key_ptr);
-                dbg_log!(self, "[dbg] GQCS: overlapped=0x{:X} bytes={} key=0x{:X}",
-                    overlapped_addr, bytes_transferred, completion_key);
-                if let Some(pending) = self.pending_overlapped.remove(&overlapped_addr) {
-                    if bytes_transferred > 0 {
-                        self.read_resolved_bufs_and_process(
-                            pid, pending.socket, &pending.bufs, bytes_transferred,
-                        );
-                    }
-                } else if bytes_transferred > 0 {
-                    // Overlapped not tracked — WSARecv likely happened before
-                    // breakpoints were installed. Use the completion key as the
-                    // socket handle and attempt to read from the OVERLAPPED's
-                    // internal buffers.
-                    dbg_log!(self, "[dbg] GQCS: untracked overlapped 0x{:X}, key(socket?)=0x{:X}, {} bytes lost",
-                        overlapped_addr, completion_key, bytes_transferred);
-                    dbg_log!(self, "[!] IOCP completion for untracked overlapped (socket?=0x{:X}, {} bytes) \
-                        — WSARecv was likely issued before breakpoints were installed",
-                        completion_key, bytes_transferred);
-                    // Auto-track the socket for future operations.
-                    self.ensure_tracked(pid, completion_key);
-                }
-            }
-            PendingCall::GqcsEx {
-                entries_ptr,
-                num_removed_ptr,
-            } => {
-                if ctx.rax == 0 {
-                    dbg_log!(self, "[dbg] GQCSEx returned FALSE");
-                    return;
-                }
-                let mut nr_bytes = [0u8; 4];
-                if !read_mem(self.process_handle, *num_removed_ptr, &mut nr_bytes) {
-                    return;
-                }
-                let num_entries = u32::from_le_bytes(nr_bytes) as usize;
-                dbg_log!(self, "[dbg] GQCSEx: {} entries completed", num_entries);
-                // OVERLAPPED_ENTRY is 32 bytes on x64:
-                //   { ULONG_PTR CompletionKey(8), LPOVERLAPPED(8),
-                //     ULONG_PTR Internal(8), DWORD dwBytes(4)+pad(4) }
-                for i in 0..num_entries {
-                    let mut entry = [0u8; 32];
-                    if !read_mem(self.process_handle, *entries_ptr + (i * 32) as u64, &mut entry) {
-                        continue;
-                    }
-                    let completion_key = u64::from_le_bytes(entry[0..8].try_into().unwrap());
-                    let overlapped_addr = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-                    let bytes_transferred = u32::from_le_bytes(
-                        [entry[24], entry[25], entry[26], entry[27]],
-                    ) as usize;
-                    dbg_log!(self, "[dbg]   entry {}: overlapped=0x{:X} bytes={} key=0x{:X}",
-                        i, overlapped_addr, bytes_transferred, completion_key);
-                    if let Some(pending) = self.pending_overlapped.remove(&overlapped_addr) {
-                        if bytes_transferred > 0 {
-                            self.read_resolved_bufs_and_process(
-                                pid, pending.socket, &pending.bufs, bytes_transferred,
-                            );
-                        }
-                    } else if bytes_transferred > 0 {
-                        dbg_log!(self, "[dbg]   untracked overlapped 0x{:X}, key(socket?)=0x{:X}, {} bytes lost",
-                            overlapped_addr, completion_key, bytes_transferred);
-                        eprintln!("[!] IOCP completion for untracked overlapped (socket?=0x{:X}, {} bytes) \
-                            — WSARecv was likely issued before breakpoints were installed",
-                            completion_key, bytes_transferred);
-                        self.ensure_tracked(pid, completion_key);
-                    }
-                }
-            }
-            PendingCall::WsaGetOverlappedResult {
-                socket,
-                overlapped_ptr,
-                transfer_ptr,
-            } => {
-                // WSAGetOverlappedResult returns BOOL (non-zero = success)
-                if ctx.rax == 0 {
-                    dbg_log!(self, "[dbg] WSAGetOverlappedResult returned FALSE for socket 0x{:X}", socket);
-                    return;
-                }
-                let mut bt = [0u8; 4];
-                if !read_mem(self.process_handle, *transfer_ptr, &mut bt) {
-                    return;
-                }
-                let bytes_transferred = u32::from_le_bytes(bt) as usize;
-                dbg_log!(self, "[dbg] WSAGetOverlappedResult: socket=0x{:X} overlapped=0x{:X} bytes={}",
-                    socket, overlapped_ptr, bytes_transferred);
-                if let Some(pending) = self.pending_overlapped.remove(overlapped_ptr) {
-                    if bytes_transferred > 0 {
-                        self.read_resolved_bufs_and_process(
-                            pid, pending.socket, &pending.bufs, bytes_transferred,
-                        );
-                    }
-                } else if bytes_transferred > 0 {
-                    dbg_log!(self, "[dbg] WSAGetOverlappedResult: untracked overlapped 0x{:X}", overlapped_ptr);
-                }
-            }
             PendingCall::CreateProcess { process_info_ptr } => {
                 // CreateProcess* returns BOOL: 0 = failure.
                 if ctx.rax == 0 {
@@ -1121,11 +882,17 @@ impl DebugTracker {
     }
 
     // ------------------------------------------------------------------
-    // Winsock handlers
+    // Connect hook → local proxy redirection
     // ------------------------------------------------------------------
 
-    fn on_connect(&mut self, pid: u32, ctx: &Amd64Context) {
-        let socket = ctx.rcx;
+    /// Intercept `connect`/`WSAConnect`. The target is already frozen (we are
+    /// servicing its breakpoint), so we can safely: read the original
+    /// destination, stand up a loopback relay listener, rewrite the
+    /// destination `sockaddr` to point at that listener, and record the
+    /// mapping. When the target resumes it connects to our proxy, which then
+    /// relays the raw stream to the real server while teeing every byte to
+    /// the TLS parser.
+    fn on_connect(&mut self, ctx: &Amd64Context) {
         let sa_ptr = ctx.rdx;
 
         let mut fam = [0u8; 2];
@@ -1133,300 +900,48 @@ impl DebugTracker {
             return;
         }
         let family = u16::from_ne_bytes(fam);
-        if family != AF_INET.0 && family != AF_INET6.0 {
+        let dest = match read_sockaddr(self.process_handle, sa_ptr, family) {
+            Some(d) => d,
+            None => {
+                dbg_log!(self, "[dbg] connect: unsupported/unreadable sockaddr (AF={})", family);
+                return;
+            }
+        };
+
+        // Never redirect our own relay's loopback connections (defensive —
+        // the relay dials out from *our* process, not the target, so this
+        // should not normally fire).
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let port = match self.proxy.start_connection(conn_id, dest) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[!] connect: failed to start proxy relay for {}: {}", dest, e);
+                return;
+            }
+        };
+
+        eprintln!(
+            "[*] connect() {} -> proxy 127.0.0.1:{} (conn {})",
+            dest, port, conn_id
+        );
+
+        if !write_redirect_sockaddr(self.process_handle, sa_ptr, port) {
+            eprintln!(
+                "[!] connect: failed to rewrite sockaddr for conn {} — \
+                 connection will reach {} unproxied",
+                conn_id, dest
+            );
             return;
         }
-        eprintln!("connect() socket=0x{:X} AF={}", socket, family);
+
         self.connections.insert(
-            (pid, socket),
+            conn_id,
             ConnectionState {
                 parser: TlsParser::new(),
                 process_handle: self.process_handle,
-            },
-        );
-    }
-
-    /// Ensure a socket is tracked. Auto-creates a connection if needed.
-    fn ensure_tracked(&mut self, pid: u32, socket: u64) {
-        let key = (pid, socket);
-        if !self.connections.contains_key(&key) {
-            dbg_log!(self, "[dbg] auto-tracking socket 0x{:X} (no connect seen)", socket);
-            self.connections.insert(
-                key,
-                ConnectionState {
-                    parser: TlsParser::new(),
-                    process_handle: self.process_handle,
-                },
-            );
-        }
-    }
-
-    fn on_send(&mut self, pid: u32, ctx: &Amd64Context, dir: Direction) {
-        let socket = ctx.rcx;
-        let ptr = ctx.rdx;
-        let len = ctx.r8 as usize;
-        if len == 0 {
-            return;
-        }
-        self.ensure_tracked(pid, socket);
-        let mut buf = vec![0u8; len];
-        if !read_mem(self.process_handle, ptr, &mut buf) {
-            return;
-        }
-        self.process_data(pid, socket, &buf, dir);
-    }
-
-    fn on_recv_entry(&mut self, _pid: u32, tid: u32, ctx: &Amd64Context) {
-        let socket = ctx.rcx;
-        let buf_ptr = ctx.rdx;
-        let max_len = ctx.r8 as usize;
-        self.ensure_tracked(self.pid, socket);
-        // Read return address from [rsp] (x64 calling convention).
-        let mut ret_bytes = [0u8; 8];
-        if !read_mem(self.process_handle, ctx.rsp, &mut ret_bytes) {
-            dbg_log!(self, "[dbg] recv: failed to read return address from rsp=0x{:X}", ctx.rsp);
-            return;
-        }
-        let ret_addr = u64::from_le_bytes(ret_bytes);
-        dbg_log!(self, "[dbg] recv: setting return BP at 0x{:X}", ret_addr);
-        self.set_return_breakpoint(
-            ret_addr,
-            tid,
-            PendingCall::Recv {
-                socket,
-                buf_ptr,
-                max_len,
-            },
-        );
-    }
-
-    fn on_recvfrom_entry(&mut self, _pid: u32, tid: u32, ctx: &Amd64Context) {
-        // recvfrom(SOCKET s, char* buf, int len, int flags, sockaddr* from, int* fromlen)
-        //   RCX=socket, RDX=buf, R8=len, R9=flags
-        let socket = ctx.rcx;
-        let buf_ptr = ctx.rdx;
-        let max_len = ctx.r8 as usize;
-        self.ensure_tracked(self.pid, socket);
-        let mut ret_bytes = [0u8; 8];
-        if !read_mem(self.process_handle, ctx.rsp, &mut ret_bytes) {
-            dbg_log!(self, "[dbg] recvfrom: failed to read return address from rsp=0x{:X}", ctx.rsp);
-            return;
-        }
-        let ret_addr = u64::from_le_bytes(ret_bytes);
-        dbg_log!(self, "[dbg] recvfrom: setting return BP at 0x{:X}", ret_addr);
-        self.set_return_breakpoint(
-            ret_addr,
-            tid,
-            PendingCall::RecvFrom {
-                socket,
-                buf_ptr,
-                max_len,
-            },
-        );
-    }
-
-    fn on_close(&mut self, pid: u32, ctx: &Amd64Context) {
-        self.connections.remove(&(pid, ctx.rcx));
-    }
-
-    fn on_wsasend(&mut self, pid: u32, ctx: &Amd64Context) {
-        let socket = ctx.rcx;
-        let lp = ctx.rdx;
-        let count = ctx.r8 as usize;
-        self.ensure_tracked(pid, socket);
-        // WSABUF on x64: { ULONG len(4), pad(4), CHAR* buf(8) } = 16 bytes
-        for i in 0..count {
-            let mut raw = [0u8; 16];
-            if !read_mem(self.process_handle, lp + (i * 16) as u64, &mut raw) {
-                continue;
-            }
-            let blen = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-            let bptr = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-            if blen == 0 {
-                continue;
-            }
-            let mut buf = vec![0u8; blen];
-            if read_mem(self.process_handle, bptr, &mut buf) {
-                self.process_data(pid, socket, &buf, Direction::Out);
-            }
-        }
-    }
-
-    fn on_wsarecv_entry(&mut self, _pid: u32, tid: u32, ctx: &Amd64Context) {
-        let socket = ctx.rcx;
-        let bufs_ptr = ctx.rdx;
-        let buf_count = ctx.r8 as u32;
-        self.ensure_tracked(self.pid, socket);
-        // Resolve WSABUF pointers eagerly so they remain valid after the
-        // stack frame is gone (important for IOCP async completions).
-        let bufs = self.resolve_wsabufs(bufs_ptr, buf_count);
-        // WSARecv arg4 (lpNumberOfBytesRecvd) is in R9 (register, not stack).
-        // [RSP+0x28] is arg5 (lpFlags) — reading that gave us a bogus byte
-        // count on synchronous completion, causing us to miss data for any
-        // recv that didn't go async (common for Go binaries, whose TLS
-        // reader often hits kernel-buffered data after the first completion).
-        let bytes_received_ptr = ctx.r9;
-        // WSARecv arg6 (lpOverlapped) is at [RSP+0x30]
-        let overlapped_ptr = read_stack_u64(self.process_handle, ctx.rsp + 0x30);
-        dbg_log!(self, "[dbg] WSARecv: overlapped=0x{:X} bytesRecvdPtr=0x{:X}", overlapped_ptr, bytes_received_ptr);
-        // Pre-register overlapped so IOCP can find it if the call is async.
-        if overlapped_ptr != 0 {
-            self.pending_overlapped.insert(overlapped_ptr, PendingOverlapped {
-                socket, bufs: bufs.clone(),
-            });
-        }
-        let mut ret_bytes = [0u8; 8];
-        if !read_mem(self.process_handle, ctx.rsp, &mut ret_bytes) {
-            dbg_log!(self, "[dbg] WSARecv: failed to read return address from rsp=0x{:X}", ctx.rsp);
-            return;
-        }
-        let ret_addr = u64::from_le_bytes(ret_bytes);
-        dbg_log!(self, "[dbg] WSARecv: setting return BP at 0x{:X}", ret_addr);
-        self.set_return_breakpoint(
-            ret_addr,
-            tid,
-            PendingCall::WsaRecv {
-                socket,
-                bufs,
-                bytes_received_ptr,
-                overlapped_ptr,
-            },
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Additional Winsock / IOCP handlers
-    // ------------------------------------------------------------------
-
-    fn on_wsasendto(&mut self, pid: u32, ctx: &Amd64Context) {
-        // WSASendTo args: RCX=socket, RDX=lpBuffers, R8=dwBufferCount
-        let socket = ctx.rcx;
-        let lp = ctx.rdx;
-        let count = ctx.r8 as usize;
-        self.ensure_tracked(pid, socket);
-        for i in 0..count {
-            let mut raw = [0u8; 16];
-            if !read_mem(self.process_handle, lp + (i * 16) as u64, &mut raw) {
-                continue;
-            }
-            let blen = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-            let bptr = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-            if blen == 0 {
-                continue;
-            }
-            let mut buf = vec![0u8; blen];
-            if read_mem(self.process_handle, bptr, &mut buf) {
-                self.process_data(pid, socket, &buf, Direction::Out);
-            }
-        }
-    }
-
-    fn on_wsarecvfrom_entry(&mut self, _pid: u32, tid: u32, ctx: &Amd64Context) {
-        let socket = ctx.rcx;
-        let bufs_ptr = ctx.rdx;
-        let buf_count = ctx.r8 as u32;
-        self.ensure_tracked(self.pid, socket);
-        let bufs = self.resolve_wsabufs(bufs_ptr, buf_count);
-        // WSARecvFrom arg4 (lpNumberOfBytesRecvd) is in R9 (register, not stack).
-        let bytes_received_ptr = ctx.r9;
-        // WSARecvFrom arg8 (lpOverlapped) is at [RSP+0x40]
-        let overlapped_ptr = read_stack_u64(self.process_handle, ctx.rsp + 0x40);
-        dbg_log!(self, "[dbg] WSARecvFrom: overlapped=0x{:X} bytesRecvdPtr=0x{:X}", overlapped_ptr, bytes_received_ptr);
-        if overlapped_ptr != 0 {
-            self.pending_overlapped.insert(overlapped_ptr, PendingOverlapped {
-                socket, bufs: bufs.clone(),
-            });
-        }
-        let mut ret_bytes = [0u8; 8];
-        if !read_mem(self.process_handle, ctx.rsp, &mut ret_bytes) {
-            dbg_log!(self, "[dbg] WSARecvFrom: failed to read return address from rsp=0x{:X}", ctx.rsp);
-            return;
-        }
-        let ret_addr = u64::from_le_bytes(ret_bytes);
-        dbg_log!(self, "[dbg] WSARecvFrom: setting return BP at 0x{:X}", ret_addr);
-        self.set_return_breakpoint(
-            ret_addr,
-            tid,
-            PendingCall::WsaRecvFrom {
-                socket,
-                bufs,
-                bytes_received_ptr,
-                overlapped_ptr,
-            },
-        );
-    }
-
-    fn on_gqcs_entry(&mut self, tid: u32, ctx: &Amd64Context) {
-        // GetQueuedCompletionStatus(hPort, lpBytesTransferred, lpKey, lpOverlapped, ms)
-        //   RCX = hCompletionPort
-        //   RDX = lpNumberOfBytesTransferred (LPDWORD, output)
-        //   R8  = lpCompletionKey (PULONG_PTR, output)
-        //   R9  = lpOverlapped (LPOVERLAPPED*, output ptr-to-ptr)
-        let bytes_transferred_ptr = ctx.rdx;
-        let completion_key_ptr = ctx.r8;
-        let overlapped_ptr_ptr = ctx.r9;
-        let mut ret_bytes = [0u8; 8];
-        if !read_mem(self.process_handle, ctx.rsp, &mut ret_bytes) {
-            return;
-        }
-        let ret_addr = u64::from_le_bytes(ret_bytes);
-        dbg_log!(self, "[dbg] GQCS: setting return BP at 0x{:X}", ret_addr);
-        self.set_return_breakpoint(
-            ret_addr,
-            tid,
-            PendingCall::Gqcs {
-                bytes_transferred_ptr,
-                completion_key_ptr,
-                overlapped_ptr_ptr,
-            },
-        );
-    }
-
-    fn on_gqcs_ex_entry(&mut self, tid: u32, ctx: &Amd64Context) {
-        // GetQueuedCompletionStatusEx(hPort, lpEntries, ulCount, ulNumRemoved, ms, fAlertable)
-        //   RCX = hCompletionPort
-        //   RDX = lpCompletionPortEntries (OVERLAPPED_ENTRY array, output)
-        //   R8  = ulCount (max entries)
-        //   R9  = ulNumEntriesRemoved (PULONG, output)
-        let entries_ptr = ctx.rdx;
-        let num_removed_ptr = ctx.r9;
-        let mut ret_bytes = [0u8; 8];
-        if !read_mem(self.process_handle, ctx.rsp, &mut ret_bytes) {
-            return;
-        }
-        let ret_addr = u64::from_le_bytes(ret_bytes);
-        dbg_log!(self, "[dbg] GQCSEx: setting return BP at 0x{:X}", ret_addr);
-        self.set_return_breakpoint(
-            ret_addr,
-            tid,
-            PendingCall::GqcsEx {
-                entries_ptr,
-                num_removed_ptr,
-            },
-        );
-    }
-
-    fn on_wsa_get_overlapped_result_entry(&mut self, tid: u32, ctx: &Amd64Context) {
-        // WSAGetOverlappedResult(SOCKET s, LPWSAOVERLAPPED lpOverlapped,
-        //   LPDWORD lpcbTransfer, BOOL fWait, LPDWORD lpdwFlags)
-        //   RCX = socket, RDX = lpOverlapped, R8 = lpcbTransfer, R9 = fWait
-        let socket = ctx.rcx;
-        let overlapped_ptr = ctx.rdx;
-        let transfer_ptr = ctx.r8;
-        self.ensure_tracked(self.pid, socket);
-        let mut ret_bytes = [0u8; 8];
-        if !read_mem(self.process_handle, ctx.rsp, &mut ret_bytes) {
-            return;
-        }
-        let ret_addr = u64::from_le_bytes(ret_bytes);
-        dbg_log!(self, "[dbg] WSAGetOverlappedResult: setting return BP at 0x{:X}", ret_addr);
-        self.set_return_breakpoint(
-            ret_addr,
-            tid,
-            PendingCall::WsaGetOverlappedResult {
-                socket,
-                overlapped_ptr,
-                transfer_ptr,
+                tls_checked: false,
+                is_tls: false,
+                dest: dest.to_string(),
             },
         );
     }
@@ -1551,6 +1066,26 @@ impl DebugTracker {
     pub(crate) fn pid(&self) -> u32 { self.pid }
     pub(crate) fn is_done(&self) -> bool { self.should_detach && !self.detached }
 
+    /// Pull every pending byte/close event produced by this tracker's proxy
+    /// relay threads and feed it through the TLS pipeline. Called once per
+    /// orchestrator loop iteration so relayed data is processed promptly even
+    /// when no debug events are firing. Non-blocking.
+    pub(crate) fn drain_proxy_events(&mut self) {
+        loop {
+            match self.proxy_rx.try_recv() {
+                Ok(ProxyEvent::Data { conn_id, dir, data }) => {
+                    self.process_data(conn_id, &data, dir);
+                }
+                Ok(ProxyEvent::Closed { conn_id }) => {
+                    if let Some(conn) = self.connections.remove(&conn_id) {
+                        dbg_log!(self, "[dbg] conn {} closed ({})", conn_id, conn.dest);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
     /// If the target process was process-suspended by the parent's child-
     /// creation hook (and we attached after-the-fact), release the whole
     /// process now via `NtResumeProcess`. This unwinds the process-wide
@@ -1576,61 +1111,35 @@ impl DebugTracker {
         self.resumed_on_attach = true;
     }
 
-    /// Resolve WSABUF structs from the target process into local ResolvedBuf entries.
-    /// Called eagerly at WSARecv/WSARecvFrom entry so the pointers are captured
-    /// before the stack frame is freed.
-    fn resolve_wsabufs(&self, bufs_ptr: u64, buf_count: u32) -> Vec<ResolvedBuf> {
-        let mut result = Vec::with_capacity(buf_count as usize);
-        // WSABUF on x64: { ULONG len(4), pad(4), CHAR* buf(8) } = 16 bytes
-        for i in 0..buf_count as usize {
-            let mut raw = [0u8; 16];
-            if !read_mem(self.process_handle, bufs_ptr + (i * 16) as u64, &mut raw) {
-                continue;
-            }
-            let blen = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-            let bptr = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-            result.push(ResolvedBuf { ptr: bptr, len: blen });
-        }
-        result
-    }
-
-    /// Read data from previously-resolved buffer pointers and feed it to the TLS parser.
-    /// `max_bytes` limits total bytes read (from IOCP/sync byte count).
-    fn read_resolved_bufs_and_process(
-        &mut self,
-        pid: u32,
-        socket: u64,
-        bufs: &[ResolvedBuf],
-        max_bytes: usize,
-    ) {
-        let mut remaining = max_bytes;
-        for rb in bufs {
-            if remaining == 0 {
-                break;
-            }
-            let to_read = rb.len.min(remaining);
-            if to_read == 0 {
-                continue;
-            }
-            let mut buf = vec![0u8; to_read];
-            if read_mem(self.process_handle, rb.ptr, &mut buf) {
-                self.process_data(pid, socket, &buf, Direction::In);
-                remaining = remaining.saturating_sub(to_read);
-            }
-        }
-    }
-
     // ------------------------------------------------------------------
     // TLS processing & key search
     // ------------------------------------------------------------------
 
-    fn process_data(&mut self, pid: u32, socket: u64, data: &[u8], dir: Direction) {
-        let key = (pid, socket);
+    fn process_data(&mut self, conn_id: u64, data: &[u8], dir: Direction) {
+        let key = conn_id;
         let conn = match self.connections.get_mut(&key) {
             Some(c) => c,
             None => return,
         };
         if conn.parser.finished {
+            return;
+        }
+
+        // Gate: only inspect connections that begin a TLS handshake. The very
+        // first outbound record of a TLS connection is a Handshake record
+        // (content type 0x16) carrying a ClientHello whose TLS major version
+        // byte is 0x03. Anything else is plain traffic that the proxy still
+        // relays verbatim — we simply stop parsing it here.
+        if !conn.tls_checked && dir == Direction::Out && !data.is_empty() {
+            conn.tls_checked = true;
+            conn.is_tls = data.len() >= 3 && data[0] == 0x16 && data[1] == 0x03;
+            if conn.is_tls {
+                dbg_log!(self, "[dbg] conn {}: TLS session initiation detected", conn_id);
+            } else {
+                dbg_log!(self, "[dbg] conn {}: first outbound bytes not TLS (0x{:02X}), relaying only", conn_id, data[0]);
+            }
+        }
+        if conn.tls_checked && !conn.is_tls {
             return;
         }
 
@@ -1685,17 +1194,17 @@ impl DebugTracker {
             if is_tls13 {
                 if may13 && found13 != TLS13_ALL {
                     eprintln!("[*] All TLS 1.3 records captured — triggering secret search");
-                    self.find_tls13_secrets(pid, socket);
+                    self.find_tls13_secrets(conn_id);
                 }
             } else if may12 {
                 eprintln!("[*] triggering TLS 1.2 master secret search");
-                self.find_master_secret(pid, socket);
+                self.find_master_secret(conn_id);
             }
         }
     }
 
-    fn find_master_secret(&mut self, pid: u32, socket: u64) {
-        let key = (pid, socket);
+    fn find_master_secret(&mut self, conn_id: u64) {
+        let key = conn_id;
         let conn = match self.connections.get(&key) {
             Some(c) => c,
             None => return,
@@ -1750,7 +1259,7 @@ impl DebugTracker {
 
         eprintln!("[*] Falling back to brute-force memory scan for master secret ...");
         self.suspend_target();
-        let reader = MemoryReader::new(handle, pid);
+        let reader = MemoryReader::new(handle, self.pid);
         let regions = reader.get_memory_regions();
         dbg_log!(self, "[dbg] scanning {} memory regions across {} threads", regions.len(), self.search_threads);
 
@@ -1815,8 +1324,8 @@ impl DebugTracker {
         }
     }
 
-    fn find_tls13_secrets(&mut self, pid: u32, socket: u64) {
-        let key = (pid, socket);
+    fn find_tls13_secrets(&mut self, conn_id: u64) {
+        let key = conn_id;
         let conn = match self.connections.get(&key) {
             Some(c) => c,
             None => return,
@@ -1922,7 +1431,7 @@ impl DebugTracker {
             );
             // Fall through into brute-force path with only the unresolved targets.
             let targets = remaining;
-            self.find_tls13_secrets_bruteforce(pid, socket, cs, cr, handle, slen, targets);
+            self.find_tls13_secrets_bruteforce(conn_id, cs, cr, handle, slen, targets);
             return;
         }
 
@@ -1937,20 +1446,19 @@ impl DebugTracker {
             return;
         }
 
-        self.find_tls13_secrets_bruteforce(pid, socket, cs, cr, handle, slen, targets);
+        self.find_tls13_secrets_bruteforce(conn_id, cs, cr, handle, slen, targets);
     }
 
     fn find_tls13_secrets_bruteforce(
         &mut self,
-        pid: u32,
-        socket: u64,
+        conn_id: u64,
         cs: &'static CipherSuite,
         cr: [u8; 32],
         handle: HANDLE,
         slen: usize,
         targets: Vec<(&'static str, TlsRecord, u64, u8)>,
     ) {
-        let key = (pid, socket);
+        let key = conn_id;
         let already_found = self
             .connections
             .get(&key)
@@ -1964,7 +1472,7 @@ impl DebugTracker {
             self.search_threads,
         );
         self.suspend_target();
-        let reader = MemoryReader::new(handle, pid);
+        let reader = MemoryReader::new(handle, self.pid);
         let all_regions = reader.get_memory_regions();
         // Read all candidate sections once while the target is suspended.
         let sections: Vec<Vec<u8>> = all_regions
@@ -2496,41 +2004,16 @@ impl DebugTracker {
             let ntdll = LoadLibraryA(windows::core::s!("ntdll.dll")).ok();
             let c = GetProcAddress(ws2, windows::core::s!("connect"));
             let wc = GetProcAddress(ws2, windows::core::s!("WSAConnect"));
-            let s = GetProcAddress(ws2, windows::core::s!("send"));
-            let r = GetProcAddress(ws2, windows::core::s!("recv"));
-            let rf = GetProcAddress(ws2, windows::core::s!("recvfrom"));
-            let st = GetProcAddress(ws2, windows::core::s!("sendto"));
-            let x = GetProcAddress(ws2, windows::core::s!("closesocket"));
-            let ws = GetProcAddress(ws2, windows::core::s!("WSASend"));
-            let wr = GetProcAddress(ws2, windows::core::s!("WSARecv"));
-            let wrf = GetProcAddress(ws2, windows::core::s!("WSARecvFrom"));
-            let wst = GetProcAddress(ws2, windows::core::s!("WSASendTo"));
-            let wgor = GetProcAddress(ws2, windows::core::s!("WSAGetOverlappedResult"));
-            let gq = GetProcAddress(k32, windows::core::s!("GetQueuedCompletionStatus"));
-            let gqe = GetProcAddress(k32, windows::core::s!("GetQueuedCompletionStatusEx"));
             let cpw = GetProcAddress(k32, windows::core::s!("CreateProcessW"));
             let cpa = GetProcAddress(k32, windows::core::s!("CreateProcessA"));
             let cpau = adv32.and_then(|h| GetProcAddress(h, windows::core::s!("CreateProcessAsUserW")));
             let ntcup = ntdll.and_then(|h| GetProcAddress(h, windows::core::s!("NtCreateUserProcess")));
             let zwcup = ntdll.and_then(|h| GetProcAddress(h, windows::core::s!("ZwCreateUserProcess")));
-            if let (Some(c), Some(wc), Some(s), Some(r), Some(rf), Some(st), Some(x), Some(ws), Some(wr), Some(wrf), Some(wst), Some(wgor), Some(gq), Some(gqe)) =
-                (c, wc, s, r, rf, st, x, ws, wr, wrf, wst, wgor, gq, gqe)
+            if let (Some(c), Some(wc)) = (c, wc)
             {
                 eprintln!("Resolved hooks:");
                 eprintln!("  connect    = 0x{:X}", c as u64);
                 eprintln!("  WSAConnect = 0x{:X}", wc as u64);
-                eprintln!("  send       = 0x{:X}", s as u64);
-                eprintln!("  recv       = 0x{:X}", r as u64);
-                eprintln!("  recvfrom   = 0x{:X}", rf as u64);
-                eprintln!("  sendto     = 0x{:X}", st as u64);
-                eprintln!("  closeskt   = 0x{:X}", x as u64);
-                eprintln!("  WSASend    = 0x{:X}", ws as u64);
-                eprintln!("  WSARecv    = 0x{:X}", wr as u64);
-                eprintln!("  WSARecvFrom= 0x{:X}", wrf as u64);
-                eprintln!("  WSASendTo  = 0x{:X}", wst as u64);
-                eprintln!("  WSAGetOvrl = 0x{:X}", wgor as u64);
-                eprintln!("  GQCS       = 0x{:X}", gq as u64);
-                eprintln!("  GQCSEx     = 0x{:X}", gqe as u64);
                 let create_process_w = cpw.map(|f| f as u64).unwrap_or(0);
                 let create_process_a = cpa.map(|f| f as u64).unwrap_or(0);
                 let create_process_as_user_w = cpau.map(|f| f as u64).unwrap_or(0);
@@ -2556,18 +2039,6 @@ impl DebugTracker {
                 self.hook_addrs = Some(HookAddresses {
                     connect: c as u64,
                     wsaconnect: wc as u64,
-                    send: s as u64,
-                    recv: r as u64,
-                    recvfrom: rf as u64,
-                    sendto: st as u64,
-                    closesocket: x as u64,
-                    wsasend: ws as u64,
-                    wsarecv: wr as u64,
-                    wsarecvfrom: wrf as u64,
-                    wsasendto: wst as u64,
-                    wsa_get_overlapped_result: wgor as u64,
-                    gqcs: gq as u64,
-                    gqcs_ex: gqe as u64,
                     create_process_w,
                     create_process_a,
                     create_process_as_user_w,
@@ -2586,18 +2057,6 @@ impl DebugTracker {
                 let mut v = vec![
                     a.connect,
                     a.wsaconnect,
-                    a.send,
-                    a.recv,
-                    a.recvfrom,
-                    a.sendto,
-                    a.closesocket,
-                    a.wsasend,
-                    a.wsarecv,
-                    a.wsarecvfrom,
-                    a.wsasendto,
-                    a.wsa_get_overlapped_result,
-                    a.gqcs,
-                    a.gqcs_ex,
                 ];
                 // Process-creation hooks are optional — only attempt to set
                 // them if their address was successfully resolved AND the
@@ -2787,6 +2246,58 @@ fn read_stack_u64(handle: HANDLE, addr: u64) -> u64 {
         0
     }
 }
+
+/// Read a `sockaddr` out of the target process and decode it into a Rust
+/// `SocketAddr`. Only AF_INET / AF_INET6 are supported (the only families we
+/// proxy); anything else yields `None`. Port and address are stored in
+/// network byte order on the wire.
+fn read_sockaddr(handle: HANDLE, sa_ptr: u64, family: u16) -> Option<SocketAddr> {
+    match family {
+        f if f == AF_INET.0 => {
+            // struct sockaddr_in { u16 family; u16 port(BE); u32 addr; ... }
+            let mut buf = [0u8; 8];
+            if !read_mem(handle, sa_ptr, &mut buf) {
+                return None;
+            }
+            let port = u16::from_be_bytes([buf[2], buf[3]]);
+            let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+            Some(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        }
+        f if f == AF_INET6.0 => {
+            // struct sockaddr_in6 {
+            //   u16 family; u16 port(BE); u32 flowinfo; u8 addr[16]; u32 scope; }
+            let mut buf = [0u8; 28];
+            if !read_mem(handle, sa_ptr, &mut buf) {
+                return None;
+            }
+            let port = u16::from_be_bytes([buf[2], buf[3]]);
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[8..24]);
+            let scope = u32::from_ne_bytes([buf[24], buf[25], buf[26], buf[27]]);
+            let ip = Ipv6Addr::from(octets);
+            Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope)))
+        }
+        _ => None,
+    }
+}
+
+/// Overwrite the target's `sockaddr` so the pending `connect` lands on our
+/// loopback relay at `127.0.0.1:port`. We always write an IPv4
+/// `sockaddr_in` (16 bytes) regardless of the original family — for an IPv6
+/// original this clobbers the first 16 bytes of the larger `sockaddr_in6`,
+/// which is fine because the supplied `namelen` is still >= sizeof
+/// `sockaddr_in` and the kernel keys off the AF_INET family we write here.
+fn write_redirect_sockaddr(handle: HANDLE, sa_ptr: u64, port: u16) -> bool {
+    let mut sa = [0u8; 16];
+    // family = AF_INET (little-endian on the wire for the u16 field)
+    sa[0..2].copy_from_slice(&AF_INET.0.to_ne_bytes());
+    // port in network byte order
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    // 127.0.0.1
+    sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    write_mem(handle, sa_ptr, &sa)
+}
+
 
 pub fn read_mem(handle: HANDLE, addr: u64, buf: &mut [u8]) -> bool {
     let mut n = 0usize;
@@ -3424,13 +2935,49 @@ impl MultiTracker {
         Ok(())
     }
 
+    /// Drain proxy relay events for every tracked process and detach from any
+    /// that finished capturing keys as a result. Runs each orchestrator loop
+    /// iteration so relayed TLS traffic is processed independently of debug
+    /// events.
+    fn pump_proxy_events(&mut self) {
+        for t in self.trackers.values_mut() {
+            t.drain_proxy_events();
+        }
+        let pids: Vec<u32> = self.trackers.keys().copied().collect();
+        for pid in pids {
+            let done = self.trackers.get(&pid).map(|t| t.is_done()).unwrap_or(false);
+            if done {
+                if let Some(t) = self.trackers.get_mut(&pid) {
+                    eprintln!(
+                        "[*] Keys captured — unhooking and detaching from PID {}",
+                        pid
+                    );
+                    t.detach_target();
+                }
+                if let Some(mut t) = self.trackers.remove(&pid) {
+                    t.finalize_summary();
+                }
+            }
+        }
+    }
+
     /// Run the debug event loop until every tracked process has either
     /// exited or been cleanly detached after capturing keys.
     pub fn run(&mut self) -> std::io::Result<()> {
         let mut event: DEBUG_EVENT = unsafe { mem::zeroed() };
 
         while !self.trackers.is_empty() {
+            // Pump relayed bytes from every tracker's proxy threads into the
+            // TLS pipeline, then reap any tracker that captured its keys as a
+            // result (there is no debug event for proxy-driven completion).
+            self.pump_proxy_events();
+            if self.trackers.is_empty() {
+                break;
+            }
+
             if unsafe { WaitForDebugEvent(&mut event, 100) }.is_err() {
+                // Timeout: no debug event this interval. Loop back to keep
+                // draining proxy traffic.
                 continue;
             }
 

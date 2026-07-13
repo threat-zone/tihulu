@@ -6,6 +6,8 @@ mod debug_tracker;
 mod call_scanner;
 #[cfg(windows)]
 mod memory_reader;
+#[cfg(windows)]
+mod proxy;
 mod tls_decrypt;
 mod tls_parser;
 mod tls_types;
