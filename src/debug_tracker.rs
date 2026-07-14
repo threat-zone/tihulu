@@ -275,6 +275,13 @@ pub struct DebugTracker {
     /// Set to true once we have successfully extracted and recorded at least
     /// one TLS secret. The event loop unhooks and detaches on the next tick.
     should_detach: bool,
+    /// Absolute path of the `SSLKEYLOGFILE` we injected into the target's
+    /// environment (`<output_dir>/<PID>_SSLKEYLOGFILE.key`). `None` when no
+    /// output directory was configured or the target was attached to (whose
+    /// frozen env block we cannot patch). Checked once at end-of-session to
+    /// report whether the target logged its own keys via the NSS key-log
+    /// convention (in addition to Tihulu's own debugger-based extraction).
+    sslkeylog_path: Option<std::path::PathBuf>,
     /// Set once we have called `DebugActiveProcessStop` so `Drop` knows it
     /// must not touch the target process's memory anymore.
     detached: bool,
@@ -333,6 +340,17 @@ impl DebugTracker {
         if resume_on_attach {
             eprintln!("[*] Target was started suspended — will resume after hook install");
         }
+        // Mirror the SSLKEYLOGFILE path injected into the target's env block
+        // (see `launch_process` / `main::run_windows`): a target that honours
+        // the NSS key-log convention writes its own secrets here, in which
+        // case Tihulu detaches rather than call-probe / memory scan. Resolved
+        // to an absolute path so it matches the value the target sees
+        // regardless of its working directory.
+        let sslkeylog_path = output_dir.as_ref().map(|dir| {
+            let abs_dir = std::path::absolute(std::path::Path::new(dir))
+                .unwrap_or_else(|_| std::path::PathBuf::from(dir));
+            abs_dir.join(format!("{}_SSLKEYLOGFILE.key", pid))
+        });
         let (proxy, proxy_rx) = ProxyManager::new(verbose);
         Self {
             process_handle: HANDLE::default(),
@@ -351,6 +369,7 @@ impl DebugTracker {
             process_name: String::new(),
             pending_child_attaches: Vec::new(),
             should_detach: false,
+            sslkeylog_path,
             detached: false,
             verbose,
             search_threads,
@@ -623,6 +642,20 @@ impl DebugTracker {
         if !self.any_tls_seen {
             eprintln!("[!] No TLS ClientHello was observed for PID {} during this session.",
                 self.pid);
+        }
+        // If the injected SSLKEYLOGFILE was created, the target honours the
+        // NSS key-log convention and wrote its own secrets there in parallel
+        // with Tihulu's debugger-based extraction. Report it as a bonus — this
+        // file is a ready-made, complete key log the user can hand straight to
+        // Wireshark. Nothing but the target ever creates this exact filename.
+        if let Some(ref path) = self.sslkeylog_path {
+            if path.exists() {
+                eprintln!(
+                    "[+] Target PID {} honours SSLKEYLOGFILE — its own key log is at {}",
+                    self.pid,
+                    path.display(),
+                );
+            }
         }
         self.connections.clear();
     }

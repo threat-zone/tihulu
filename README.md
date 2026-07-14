@@ -25,6 +25,8 @@ Whenever Tihulu **launches** the target itself and an output directory is config
 
 Implementation detail: the child is spawned `CREATE_SUSPENDED`, the placeholder PID in the inherited env block is patched in place via `PEB → ProcessParameters → Environment`, then the main thread is resumed. This path is launch-only — when attaching to an already-running process (`--pid`), the env block is already frozen and Tihulu falls back to the debugger-based strategies below.
 
+If the target actually honours the variable, the injected `<dir>\<PID>_SSLKEYLOGFILE.key` file appears. The debugger-based strategies below still run in full regardless — but at end of session Tihulu checks for that file and, if present, prints an extra success message pointing at it. Nothing else ever creates this exact filename (Tihulu's own keys go to a separate `_tls.key` file), so its presence is an unambiguous signal that the target produced a complete, ready-to-use key log of its own alongside Tihulu's extraction.
+
 ### 1. CALL-probe scanner (primary)
 
 Tihulu disassembles every executable region of the target process using [iced-x86](https://github.com/icedland/iced) and installs INT3 breakpoints on every `CALL` instruction (up to 200 000 sites). At each hit, it inspects the x86-64 System V / Microsoft ABI argument registers (RCX, RDX, R8, R9):
