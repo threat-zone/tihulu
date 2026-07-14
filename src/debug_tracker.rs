@@ -1,19 +1,27 @@
 //! Windows Debug API based connection tracker.
 //!
 //! Rather than hooking the many Winsock read/write entry points, Tihulu now
-//! installs INT3 software breakpoints **only** on the initial TCP connect
-//! functions (`connect`, `WSAConnect`). At connect time the destination
-//! `sockaddr` is rewritten to a loopback listener owned by the local proxy
-//! relay (see [`crate::proxy`]); the target then dials our relay, which pumps
-//! the raw TCP stream to/from the real server and tees every byte to the TLS
-//! parser. This sidesteps all of the async / overlapped / IOCP race
-//! conditions that plagued the per-call read/write hooks.
+//! installs INT3 software breakpoints **only** on the TCP connection-
+//! establishment functions. At connect time the destination `sockaddr` (or,
+//! for the resolve-and-connect helpers, the nodename/servicename arguments) is
+//! rewritten to a loopback listener owned by the local proxy relay (see
+//! [`crate::proxy`]); the target then dials our relay, which pumps the raw TCP
+//! stream to/from the real server and tees every byte to the TLS parser. This
+//! sidesteps all of the async / overlapped / IOCP race conditions that plagued
+//! the per-call read/write hooks.
+//!
+//! Hooked connection paths:
+//! - `connect` / `WSAConnect` (ws2_32): plain synchronous connects.
+//! - `ConnectEx` (mswsock): overlapped connect used by WinHTTP and other
+//!   high-level HTTP stacks that never reach `connect`. Same RDX sockaddr.
+//! - `WSAConnectByName{W,A}` (ws2_32): resolve-and-connect helpers; redirected
+//!   by repointing their nodename/servicename arguments.
 //!
 //! Key design points:
-//! - Function breakpoints (INT3) on connect/WSAConnect only.
 //! - Captured bytes arrive over a channel from the relay threads and are fed
 //!   to the same TLS parser + CALL-probe / fallback secret search as before.
-//! - Breakpoints are retried on each LOAD_DLL event until ws2_32 is mapped.
+//! - Mandatory hooks are retried on each LOAD_DLL event until ws2_32 is mapped;
+//!   the optional `ConnectEx` hook is retried until mswsock is mapped.
 //! - CreateProcess-family hooks remain (optional) for `--trace-children`.
 //! - DEBUG_ONLY_THIS_PROCESS avoids child-process handle confusion.
 
@@ -125,6 +133,16 @@ extern "system" {
 struct HookAddresses {
     connect: u64,
     wsaconnect: u64,
+    // Winsock connection paths used by higher-level HTTP stacks
+    // (wininet.dll / winhttp.dll) that never reach the plain `connect` /
+    // `WSAConnect` entry points. All optional: zero means "not resolved yet".
+    //   - `ConnectEx` (mswsock.dll): overlapped connect used by WinHTTP. Its
+    //     address is obtained in *our* process via WSAIoctl and is valid in
+    //     the target once mswsock is mapped there (shared system-DLL base).
+    //   - `WSAConnectByName{W,A}` (ws2_32.dll): resolve-and-connect helpers.
+    connect_ex: u64,
+    wsa_connect_by_name_w: u64,
+    wsa_connect_by_name_a: u64,
     // Process-creation APIs — we hook these so we can also trace any child
     // process spawned by the target. Optional: zero means "not resolved".
     create_process_w: u64,
@@ -339,7 +357,7 @@ impl DebugTracker {
             any_tls_seen: false,
             loaded_modules: HashMap::new(),
             main_image_base: 0,
-            scanner: CallScanner::new(0, verbose),
+            scanner: CallScanner::new(verbose),
             call_probe_enabled,
             max_call_bps,
             fallback_scan,
@@ -583,6 +601,10 @@ impl DebugTracker {
                         self.maybe_resume_on_attach();
                     }
                 }
+                // Always (re)attempt the optional HTTP-stack connect hooks:
+                // ConnectEx lives in mswsock.dll, which may map only after the
+                // mandatory hooks are armed and the loop above has stopped.
+                self.try_set_optional_connect_hooks();
                 DBG_CONTINUE
             }
             UNLOAD_DLL_DEBUG_EVENT => {
@@ -774,9 +796,18 @@ impl DebugTracker {
             None => return,
         };
 
-        if addr == addrs.connect || addr == addrs.wsaconnect {
-            dbg_log!(self, "[dbg] => connect/WSAConnect()");
+        if addr == addrs.connect
+            || addr == addrs.wsaconnect
+            || (addrs.connect_ex != 0 && addr == addrs.connect_ex)
+        {
+            dbg_log!(self, "[dbg] => connect/WSAConnect/ConnectEx()");
             self.on_connect(&ctx);
+        } else if addrs.wsa_connect_by_name_w != 0 && addr == addrs.wsa_connect_by_name_w {
+            dbg_log!(self, "[dbg] => WSAConnectByNameW()");
+            self.on_wsa_connect_by_name(th, &ctx, true);
+        } else if addrs.wsa_connect_by_name_a != 0 && addr == addrs.wsa_connect_by_name_a {
+            dbg_log!(self, "[dbg] => WSAConnectByNameA()");
+            self.on_wsa_connect_by_name(th, &ctx, false);
         } else if addrs.create_process_w != 0 && addr == addrs.create_process_w {
             dbg_log!(self, "[dbg] => CreateProcessW()");
             self.on_create_process_entry(tid, &ctx);
@@ -885,7 +916,48 @@ impl DebugTracker {
     // Connect hook → local proxy redirection
     // ------------------------------------------------------------------
 
-    /// Intercept `connect`/`WSAConnect`. The target is already frozen (we are
+    /// Stand up a loopback relay for `dest`, register the connection so its
+    /// teed bytes are parsed, and return the loopback proxy port the target
+    /// should be redirected to. Returns `None` if the relay could not be
+    /// started (the caller should then leave the original destination intact).
+    fn begin_relay(&mut self, dest: SocketAddr) -> Option<u16> {
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let port = match self.proxy.start_connection(conn_id, dest) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[!] failed to start proxy relay for {}: {}", dest, e);
+                return None;
+            }
+        };
+        eprintln!("[*] {} -> proxy 127.0.0.1:{} (conn {})", dest, port, conn_id);
+        self.connections.insert(
+            conn_id,
+            ConnectionState {
+                parser: TlsParser::new(),
+                process_handle: self.process_handle,
+                tls_checked: false,
+                is_tls: false,
+                dest: dest.to_string(),
+            },
+        );
+
+        // Arm the CALL-probe scanner right here — synchronously, while the
+        // target is frozen servicing this connect breakpoint and *before* it
+        // performs the TLS handshake. Arming off the parsed ClientHello would
+        // be far too late: the relay forwards bytes to the real server without
+        // blocking the target, and the teed copy is parsed asynchronously on
+        // the orchestrator loop, so the target routinely completes the whole
+        // handshake (and even exits) before our parser ever observes the
+        // ClientHello. Servicing the connect BP is the earliest point that is
+        // synchronized with target execution and guaranteed to precede any TLS
+        // key derivation. No-op if already armed or call-probing is disabled.
+        self.arm_call_scanner();
+
+        Some(port)
+    }
+
+    /// Intercept `connect` / `WSAConnect` / `ConnectEx`. All three take the
+    /// destination `sockaddr` in RDX. The target is already frozen (we are
     /// servicing its breakpoint), so we can safely: read the original
     /// destination, stand up a loopback relay listener, rewrite the
     /// destination `sockaddr` to point at that listener, and record the
@@ -908,42 +980,77 @@ impl DebugTracker {
             }
         };
 
-        // Never redirect our own relay's loopback connections (defensive —
-        // the relay dials out from *our* process, not the target, so this
-        // should not normally fire).
-        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-        let port = match self.proxy.start_connection(conn_id, dest) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[!] connect: failed to start proxy relay for {}: {}", dest, e);
-                return;
-            }
+        let port = match self.begin_relay(dest) {
+            Some(p) => p,
+            None => return,
         };
-
-        eprintln!(
-            "[*] connect() {} -> proxy 127.0.0.1:{} (conn {})",
-            dest, port, conn_id
-        );
 
         if !write_redirect_sockaddr(self.process_handle, sa_ptr, port) {
             eprintln!(
-                "[!] connect: failed to rewrite sockaddr for conn {} — \
+                "[!] connect: failed to rewrite sockaddr — \
                  connection will reach {} unproxied",
-                conn_id, dest
+                dest
             );
-            return;
         }
+    }
 
-        self.connections.insert(
-            conn_id,
-            ConnectionState {
-                parser: TlsParser::new(),
-                process_handle: self.process_handle,
-                tls_checked: false,
-                is_tls: false,
-                dest: dest.to_string(),
-            },
-        );
+    /// Intercept `WSAConnectByNameW` / `WSAConnectByNameA`. These resolve a
+    /// (nodename, servicename) pair and connect internally, never reaching
+    /// `connect`/`ConnectEx` in a hookable way, so we redirect at the source:
+    /// resolve the real destination ourselves, stand up a relay, then repoint
+    /// the nodename argument (RDX) at `"127.0.0.1"` and the servicename
+    /// argument (R8) at the relay's port. The original hostname is only used
+    /// here for the TCP connect — the upper (schannel) layer keeps its own copy
+    /// for SNI/Host, so this redirection does not disturb the TLS handshake.
+    fn on_wsa_connect_by_name(&mut self, th: HANDLE, ctx: &Amd64Context, wide: bool) {
+        let host = match read_c_string(self.process_handle, ctx.rdx, wide) {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                dbg_log!(self, "[dbg] WSAConnectByName: unreadable/empty nodename");
+                return;
+            }
+        };
+        let port = match read_c_string(self.process_handle, ctx.r8, wide)
+            .as_deref()
+            .and_then(parse_service_port)
+        {
+            Some(p) => p,
+            None => {
+                dbg_log!(self, "[dbg] WSAConnectByName: unrecognised service for {}, leaving unredirected", host);
+                return;
+            }
+        };
+        let dest = match resolve_host(&host, port) {
+            Some(d) => d,
+            None => {
+                eprintln!("[!] WSAConnectByName: could not resolve {}:{}", host, port);
+                return;
+            }
+        };
+        dbg_log!(self, "[dbg] WSAConnectByName {}:{} -> {}", host, port, dest);
+
+        let proxy_port = match self.begin_relay(dest) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let new_node = match alloc_string_in_target(self.process_handle, "127.0.0.1", wide) {
+            Some(p) => p,
+            None => {
+                eprintln!("[!] WSAConnectByName: VirtualAllocEx (nodename) failed — {} unproxied", dest);
+                return;
+            }
+        };
+        let new_svc = match alloc_string_in_target(self.process_handle, &proxy_port.to_string(), wide) {
+            Some(p) => p,
+            None => {
+                eprintln!("[!] WSAConnectByName: VirtualAllocEx (servicename) failed — {} unproxied", dest);
+                return;
+            }
+        };
+        if !set_rdx_r8(th, new_node, new_svc) {
+            eprintln!("[!] WSAConnectByName: failed to repoint arguments — {} unproxied", dest);
+        }
     }
 
     /// CreateProcess{A,W} entry. 10 arguments on x64 — the first 4 go in
@@ -1151,24 +1258,14 @@ impl DebugTracker {
         }
 
         // Track at the DebugTracker level so it persists past closesocket.
+        // (The CALL-probe scanner is armed synchronously at connect time in
+        // `begin_relay`, not here — see the note there. By the time these teed
+        // bytes are parsed the target has usually already derived its keys, so
+        // this path is purely for observing the handshake and driving the
+        // secret search once enough records are captured.)
         if conn.parser.client_hello_seen {
             self.any_tls_seen = true;
         }
-
-        // Arm the CALL-probe scanner as soon as the ServerHello has been
-        // parsed and a cipher suite is known. For TLS 1.3 the traffic-secret
-        // length is slen(32|48); for TLS 1.2 we use the master-secret length.
-        let arm_slen = if conn.parser.cipher_suite_set && !self.scanner.is_armed() {
-            conn.parser.cipher_suite.map(|cs| {
-                if cs.is_tls13() {
-                    cs.secret_len()
-                } else {
-                    SSL_MASTER_SECRET_LENGTH
-                }
-            })
-        } else {
-            None
-        };
 
         dbg_log!(self, "[dbg]   parser state: finished={} is_tls13={} has_cr={} has_sr={} cipher={:?}",
             conn.parser.finished,
@@ -1181,10 +1278,6 @@ impl DebugTracker {
             conn.parser.may_decrypt_tls12(),
             conn.parser.may_decrypt_tls13(),
         );
-
-        if let Some(slen) = arm_slen {
-            self.arm_call_scanner(slen);
-        }
 
         if !self.connections.get(&key).map(|c| c.parser.finished).unwrap_or(true) {
             let is_tls13 = self.connections.get(&key).map(|c| c.parser.is_tls13).unwrap_or(false);
@@ -1739,17 +1832,22 @@ impl DebugTracker {
     // CALL-probe scanner: arm / disarm / hit handler / trial decrypt
     // ------------------------------------------------------------------
 
-    /// Arm the CALL-probe scanner once ServerHello has been parsed and the
-    /// cipher's secret length is known. No-op if already armed or disabled.
-    fn arm_call_scanner(&mut self, slen: usize) {
+    /// Arm the CALL-probe scanner as soon as a ClientHello is observed. The
+    /// negotiated cipher (and true secret length) is not yet known, so the
+    /// scanner harvests candidates of every length in `call_scanner::SECRET_LENS`.
+    /// No-op if already armed or disabled.
+    fn arm_call_scanner(&mut self) {
         if !self.call_probe_enabled {
             return;
         }
         if self.scanner.is_armed() {
             return;
         }
-        eprintln!("[*] Arming CALL-probe scanner (secret_len={})", slen);
-        self.scanner = CallScanner::new(slen, self.verbose);
+        eprintln!(
+            "[*] Arming CALL-probe scanner (harvesting secret lengths {:?})",
+            call_scanner::SECRET_LENS
+        );
+        self.scanner = CallScanner::new(self.verbose);
         self.scanner.phase = ScanPhase::Harvesting;
 
         self.suspend_target();
@@ -1868,7 +1966,6 @@ impl DebugTracker {
             Some(c) => c,
             None => return false,
         };
-        let slen = self.scanner.secret_len as u64;
         let regs = [
             (ArgReg::Rcx, ctx.rcx),
             (ArgReg::Rdx, ctx.rdx),
@@ -1876,9 +1973,15 @@ impl DebugTracker {
             (ArgReg::R9, ctx.r9),
         ];
 
-        // Find a register holding exactly the secret length.
-        let len_holder = regs.iter().find(|(_, v)| *v == slen).copied();
-        if let Some((rl, _)) = len_holder {
+        // The negotiated cipher is unknown while harvesting, so probe every
+        // plausible secret length: for each, find a register holding exactly
+        // that length and sample that many bytes from the other pointer regs.
+        for &slen in call_scanner::SECRET_LENS.iter() {
+            let len_holder = regs.iter().find(|(_, v)| *v == slen as u64).copied();
+            let (rl, _) = match len_holder {
+                Some(h) => h,
+                None => continue,
+            };
             for &(rp, v) in regs.iter() {
                 if rp == rl {
                     continue;
@@ -1892,15 +1995,15 @@ impl DebugTracker {
                     None => continue,
                 };
                 let in_private = matches!(cls, crate::memory_reader::PtrClass::Private);
-                let mut buf = vec![0u8; self.scanner.secret_len];
+                let mut buf = vec![0u8; slen];
                 if !read_mem(self.process_handle, v, &mut buf) {
                     continue;
                 }
                 if self.scanner.record_candidate(buf, v, addr, rp, rl, in_private) {
                     dbg_log!(
                         self,
-                        "[dbg] candidate @ call=0x{:X} ptr={:?}=0x{:X} ({}) len_reg={:?}",
-                        addr, rp, v, if in_private { "priv" } else { "shared" }, rl
+                        "[dbg] candidate @ call=0x{:X} ptr={:?}=0x{:X} ({}) len={} len_reg={:?}",
+                        addr, rp, v, if in_private { "priv" } else { "shared" }, slen, rl
                     );
                 }
             }
@@ -1948,7 +2051,9 @@ impl DebugTracker {
         record: &TlsRecord,
         seq: u64,
     ) -> Option<Vec<u8>> {
-        let slen = self.scanner.secret_len;
+        // The cipher is known now, so restrict to candidates of its exact
+        // secret length (the scanner harvested both 32- and 48-byte buffers).
+        let slen = cs.secret_len();
         for cand in self.scanner.ranked_candidates() {
             if cand.bytes.len() != slen {
                 continue;
@@ -2004,16 +2109,33 @@ impl DebugTracker {
             let ntdll = LoadLibraryA(windows::core::s!("ntdll.dll")).ok();
             let c = GetProcAddress(ws2, windows::core::s!("connect"));
             let wc = GetProcAddress(ws2, windows::core::s!("WSAConnect"));
+            // Higher-level HTTP-stack connection paths (optional).
+            let wbnw = GetProcAddress(ws2, windows::core::s!("WSAConnectByNameW"));
+            let wbna = GetProcAddress(ws2, windows::core::s!("WSAConnectByNameA"));
             let cpw = GetProcAddress(k32, windows::core::s!("CreateProcessW"));
             let cpa = GetProcAddress(k32, windows::core::s!("CreateProcessA"));
             let cpau = adv32.and_then(|h| GetProcAddress(h, windows::core::s!("CreateProcessAsUserW")));
             let ntcup = ntdll.and_then(|h| GetProcAddress(h, windows::core::s!("NtCreateUserProcess")));
             let zwcup = ntdll.and_then(|h| GetProcAddress(h, windows::core::s!("ZwCreateUserProcess")));
+            // ConnectEx has no stable name export; resolve it through
+            // WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER) in our own process.
+            let connect_ex = resolve_connect_ex().unwrap_or(0);
+            let wsa_connect_by_name_w = wbnw.map(|f| f as u64).unwrap_or(0);
+            let wsa_connect_by_name_a = wbna.map(|f| f as u64).unwrap_or(0);
             if let (Some(c), Some(wc)) = (c, wc)
             {
                 eprintln!("Resolved hooks:");
                 eprintln!("  connect    = 0x{:X}", c as u64);
                 eprintln!("  WSAConnect = 0x{:X}", wc as u64);
+                if connect_ex != 0 {
+                    eprintln!("  ConnectEx  = 0x{:X}", connect_ex);
+                }
+                if wsa_connect_by_name_w != 0 {
+                    eprintln!("  WSAConnectByNameW = 0x{:X}", wsa_connect_by_name_w);
+                }
+                if wsa_connect_by_name_a != 0 {
+                    eprintln!("  WSAConnectByNameA = 0x{:X}", wsa_connect_by_name_a);
+                }
                 let create_process_w = cpw.map(|f| f as u64).unwrap_or(0);
                 let create_process_a = cpa.map(|f| f as u64).unwrap_or(0);
                 let create_process_as_user_w = cpau.map(|f| f as u64).unwrap_or(0);
@@ -2039,6 +2161,9 @@ impl DebugTracker {
                 self.hook_addrs = Some(HookAddresses {
                     connect: c as u64,
                     wsaconnect: wc as u64,
+                    connect_ex,
+                    wsa_connect_by_name_w,
+                    wsa_connect_by_name_a,
                     create_process_w,
                     create_process_a,
                     create_process_as_user_w,
@@ -2085,6 +2210,32 @@ impl DebugTracker {
             }
         }
         all_ok
+    }
+
+    /// Install the optional HTTP-stack connect hooks (`ConnectEx`,
+    /// `WSAConnectByName{W,A}`) if their addresses are known and not yet armed.
+    /// Unlike the mandatory `connect`/`WSAConnect` hooks these are *not* gated
+    /// on `breakpoints_active`: `ConnectEx` lives in `mswsock.dll`, which the
+    /// target may map only after the mandatory hooks are already installed (at
+    /// which point the mandatory retry loop stops). Calling this on every
+    /// LOAD_DLL guarantees we still arm ConnectEx once mswsock appears.
+    /// `set_function_breakpoint` is idempotent, so repeat calls are harmless.
+    fn try_set_optional_connect_hooks(&mut self) {
+        let hooks = match &self.hook_addrs {
+            Some(a) => [
+                (a.connect_ex, "ConnectEx"),
+                (a.wsa_connect_by_name_w, "WSAConnectByNameW"),
+                (a.wsa_connect_by_name_a, "WSAConnectByNameA"),
+            ],
+            None => return,
+        };
+        for (addr, name) in hooks {
+            if addr != 0 && !self.breakpoints.contains_key(&addr) {
+                if self.set_function_breakpoint(addr) {
+                    eprintln!("[+] Installed {} hook @ 0x{:X} (PID {})", name, addr, self.pid);
+                }
+            }
+        }
     }
 
     fn set_function_breakpoint(&mut self, address: u64) -> bool {
@@ -2244,6 +2395,175 @@ fn read_stack_u64(handle: HANDLE, addr: u64) -> u64 {
         u64::from_le_bytes(bytes)
     } else {
         0
+    }
+}
+
+/// Resolve the runtime address of `ConnectEx`. It is exported only as a
+/// Winsock extension function (not by name), so we ask for it via
+/// `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` on a throwaway socket in
+/// *our own* process. Because `mswsock.dll` is a shared system DLL it maps at
+/// the same base in the target for this boot session, so the returned address
+/// is valid to breakpoint there once the target has mapped mswsock.
+fn resolve_connect_ex() -> Option<u64> {
+    unsafe {
+        let mut wsadata: WSADATA = mem::zeroed();
+        // Winsock is refcounted; std::net may have already started it. Balanced
+        // by the WSACleanup below.
+        if WSAStartup(0x0202, &mut wsadata) != 0 {
+            return None;
+        }
+        let addr = (|| {
+            let sock = socket(AF_INET.0 as i32, SOCK_STREAM, IPPROTO_TCP.0).ok()?;
+            if sock == INVALID_SOCKET {
+                return None;
+            }
+            let mut func: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut bytes: u32 = 0;
+            let guid = WSAID_CONNECTEX;
+            let rc = WSAIoctl(
+                sock,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                Some(&guid as *const _ as *const _),
+                mem::size_of::<windows::core::GUID>() as u32,
+                Some(&mut func as *mut _ as *mut _),
+                mem::size_of::<*mut core::ffi::c_void>() as u32,
+                &mut bytes,
+                None,
+                None,
+            );
+            let _ = closesocket(sock);
+            if rc == 0 && !func.is_null() {
+                Some(func as u64)
+            } else {
+                None
+            }
+        })();
+        let _ = WSACleanup();
+        addr
+    }
+}
+
+/// Read a NUL-terminated C string (ANSI or UTF-16) out of the target process.
+/// Reads in small chunks up to `MAX` bytes to avoid over-reading past region
+/// boundaries. Returns `None` on read failure or if no terminator is found.
+fn read_c_string(handle: HANDLE, ptr: u64, wide: bool) -> Option<String> {
+    const MAX: usize = 1024;
+    if ptr == 0 {
+        return None;
+    }
+    if wide {
+        let mut units: Vec<u16> = Vec::new();
+        let mut off = 0u64;
+        while units.len() < MAX {
+            let mut buf = [0u8; 2];
+            if !read_mem(handle, ptr + off, &mut buf) {
+                return None;
+            }
+            let u = u16::from_le_bytes(buf);
+            if u == 0 {
+                break;
+            }
+            units.push(u);
+            off += 2;
+        }
+        Some(String::from_utf16_lossy(&units))
+    } else {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut off = 0u64;
+        while bytes.len() < MAX {
+            let mut buf = [0u8; 1];
+            if !read_mem(handle, ptr + off, &mut buf) {
+                return None;
+            }
+            if buf[0] == 0 {
+                break;
+            }
+            bytes.push(buf[0]);
+            off += 1;
+        }
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// Parse a Winsock service string into a TCP port. Accepts a decimal port or a
+/// small set of well-known service names. Returns `None` for anything we can't
+/// map, so the caller can leave the connection unredirected rather than guess.
+fn parse_service_port(svc: &str) -> Option<u16> {
+    let s = svc.trim();
+    if let Ok(p) = s.parse::<u16>() {
+        if p != 0 {
+            return Some(p);
+        }
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "https" => Some(443),
+        "http" => Some(80),
+        "ftp" => Some(21),
+        "smtp" => Some(25),
+        "imap" | "imap2" => Some(143),
+        "imaps" => Some(993),
+        "pop3" => Some(110),
+        "pop3s" => Some(995),
+        "smtps" => Some(465),
+        _ => None,
+    }
+}
+
+/// Resolve `host:port` to a concrete socket address in our own process so the
+/// relay can dial the true upstream. Prefers the first address returned.
+fn resolve_host(host: &str, port: u16) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    (host, port).to_socket_addrs().ok()?.next()
+}
+
+/// Allocate a NUL-terminated string (ANSI or UTF-16) inside the target and
+/// return its base address, or `None` on failure. The allocation is
+/// intentionally leaked: `WSAConnectByName*` consumes the pointer synchronously
+/// and the few bytes per call are not worth an extra return-breakpoint to free.
+fn alloc_string_in_target(handle: HANDLE, s: &str, wide: bool) -> Option<u64> {
+    let bytes: Vec<u8> = if wide {
+        let mut v: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        v.extend_from_slice(&[0, 0]);
+        v
+    } else {
+        let mut v = s.as_bytes().to_vec();
+        v.push(0);
+        v
+    };
+    let base = unsafe {
+        VirtualAllocEx(
+            handle,
+            None,
+            bytes.len(),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    } as u64;
+    if base == 0 {
+        return None;
+    }
+    if !write_mem(handle, base, &bytes) {
+        return None;
+    }
+    Some(base)
+}
+
+/// Overwrite the RDX and R8 integer-argument registers of `thread`, preserving
+/// all other register state. Used to repoint `WSAConnectByName*`'s nodename /
+/// servicename arguments at our loopback replacements. The subsequent
+/// `set_rip` in the exception handler only touches control registers, so these
+/// integer writes survive.
+fn set_rdx_r8(thread: HANDLE, rdx: u64, r8: u64) -> bool {
+    unsafe {
+        let mut ctx: Amd64Context = mem::zeroed();
+        ctx.context_flags = CTX_FULL;
+        if !GetThreadContext(thread, &mut ctx).as_bool() {
+            return false;
+        }
+        ctx.rdx = rdx;
+        ctx.r8 = r8;
+        ctx.context_flags = CTX_FULL;
+        SetThreadContext(thread, &ctx).as_bool()
     }
 }
 

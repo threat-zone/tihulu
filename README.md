@@ -7,7 +7,13 @@ A Windows TLS 1.2/1.3 key extractor that uses the Windows Debug API to intercept
 
 ## How does it work?
 
-Tihulu attaches to a target process as a debugger (or launches it as a child) and sets a software breakpoint (INT3) only on the Winsock connect entry points — `connect` and `WSAConnect`. When the target initiates a connection it is briefly frozen while Tihulu rewrites the destination `sockaddr` to point at a loopback listener it owns, recording the original `IP:PORT` and the randomly chosen proxy port. The target then transparently connects to this local relay, which pumps the raw TCP stream to and from the real server while teeing a copy of every byte to an in-process TLS parser. Because the relay never terminates TLS, the genuine session secrets are still derived inside the target's own memory — exactly where the scanners below look for them.
+Tihulu attaches to a target process as a debugger (or launches it as a child) and sets software breakpoints (INT3) on the Winsock connection-establishment entry points. When the target initiates a connection it is briefly frozen while Tihulu rewrites the destination to point at a loopback listener it owns, recording the original `IP:PORT` and the randomly chosen proxy port. The target then transparently connects to this local relay, which pumps the raw TCP stream to and from the real server while teeing a copy of every byte to an in-process TLS parser. Because the relay never terminates TLS, the genuine session secrets are still derived inside the target's own memory — exactly where the scanners below look for them.
+
+The following entry points are hooked so high-level HTTP stacks are covered as well as raw sockets:
+
+* **`connect` / `WSAConnect`** (`ws2_32.dll`) — plain synchronous connects. The destination `sockaddr` (RDX) is rewritten to the loopback listener.
+* **`ConnectEx`** (`mswsock.dll`) — the overlapped connect used by **WinHTTP** and other stacks that never reach `connect`. It takes the same `sockaddr` in RDX, so the identical rewrite applies. Its address (exported only as a Winsock extension) is resolved via `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` and armed once `mswsock.dll` maps into the target.
+* **`WSAConnectByNameW` / `WSAConnectByNameA`** (`ws2_32.dll`) — resolve-and-connect helpers that never surface a `sockaddr`. Tihulu resolves the real destination itself, then repoints the `nodename` argument at `127.0.0.1` and the `servicename` argument at the relay port. The original hostname is untouched for the upper layer, so TLS **SNI**/`Host` are preserved.
 
 The teed byte stream is fed to a TLS parser that tracks the handshake, extracts the **ClientRandom**, **ServerRandom**, and negotiated **cipher suite**, and identifies when application-data records are available for trial decryption. Connections whose first outbound bytes are not a TLS handshake are relayed verbatim and otherwise ignored.
 
@@ -117,5 +123,5 @@ TLS 1.3 per-epoch traffic secrets (handshake + application) are extracted indepe
 * **Memory obfuscation** — A target can trivially evade secret extraction by XOR-masking keys while they are in memory, only unmasking them inside the crypto primitive. A single XOR pass would defeat both scanning strategies.
 * **Windows x86-64 only** — The CALL-probe scanner and context capture rely on the Microsoft x64 ABI and Windows Debug API; 32-bit processes are not supported.
 * **No kernel-mode TLS** — Traffic handled entirely in kernel mode (e.g., HTTP.sys with kernel TLS offload) is not intercepted.
-* **Connection-oriented sockets only** — Interception keys off `connect`/`WSAConnect`, so the TCP relay covers connected sockets. Connectionless datagram flows (`sendto`/`recvfrom` without a prior `connect`) are not proxied.
+* **Connection-oriented sockets only** — Interception keys off the TCP connect entry points (`connect`/`WSAConnect`/`ConnectEx`/`WSAConnectByName{W,A}`), so the relay covers connected sockets. Connectionless datagram flows (`sendto`/`recvfrom` without a prior `connect`) are not proxied.
 

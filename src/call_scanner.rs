@@ -5,14 +5,18 @@
 //! and inspects x64 register arguments (RCX, RDX, R8, R9) at each hit.
 //!
 //! A CALL is considered a secret-carrying candidate when:
-//!   1. one argument register holds exactly the cipher's secret length
-//!      (32 for SHA-256 ciphers, 48 for SHA-384), AND
+//!   1. one argument register holds exactly one of the plausible TLS secret
+//!      lengths ([`SECRET_LENS`]: 32 for SHA-256 ciphers, 48 for SHA-384 /
+//!      the TLS 1.2 master secret), AND
 //!   2. another argument register holds a pointer to a readable memory
 //!      region (MEM_PRIVATE heap/stack is preferred over MEM_IMAGE).
 //!
-//! The first `secret_len` bytes at that pointer are captured as a candidate
-//! secret. Candidates are deduplicated by content. When a TLS record is
-//! available for trial decryption, every candidate is tested.
+//! Because the scanner is armed as soon as a ClientHello is seen — before the
+//! negotiated cipher (and thus the true secret length) is known — it harvests
+//! candidates for *every* length in [`SECRET_LENS`]. The matching length's
+//! worth of bytes at that pointer are captured as a candidate secret.
+//! Candidates are deduplicated by content. When a TLS record is available for
+//! trial decryption, every candidate of the cipher's actual length is tested.
 
 #![cfg(windows)]
 
@@ -22,6 +26,12 @@ use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 
 use crate::memory_reader::{self, MemoryReader, PtrClass};
 
+
+/// Plausible TLS secret lengths to harvest. 32 covers SHA-256 TLS 1.3
+/// traffic secrets; 48 covers SHA-384 TLS 1.3 traffic secrets and the TLS 1.2
+/// master secret. The scanner arms before the cipher is negotiated, so it
+/// captures candidates of every length here and lets trial decryption pick.
+pub const SECRET_LENS: [usize; 2] = [32, 48];
 
 /// Number of non-matching hits after which a CALL BP is culled.
 pub const CULL_THRESHOLD: u32 = 8;
@@ -87,7 +97,6 @@ pub struct Candidate {
 
 #[allow(dead_code)]
 pub struct CallScanner {
-    pub secret_len: usize,
     /// Original instruction byte per armed CALL site (address → byte).
     pub bps: HashMap<u64, u8>,
     /// Per-site hit counter for dynamic culling.
@@ -106,9 +115,8 @@ pub struct CallScanner {
 }
 
 impl CallScanner {
-    pub fn new(secret_len: usize, verbose: bool) -> Self {
+    pub fn new(verbose: bool) -> Self {
         Self {
-            secret_len,
             bps: HashMap::new(),
             hit_count: HashMap::new(),
             ever_matched: HashMap::new(),
@@ -153,8 +161,8 @@ impl CallScanner {
     }
 
     /// Record a possible candidate observed at a CALL breakpoint hit.
-    /// `bytes` must be exactly `self.secret_len` long and already sampled
-    /// from the target process at `src_ptr`. Returns true if newly recorded.
+    /// `bytes` must be one of the [`SECRET_LENS`] and already sampled from the
+    /// target process at `src_ptr`. Returns true if newly recorded.
     pub fn record_candidate(
         &mut self,
         bytes: Vec<u8>,
@@ -164,7 +172,7 @@ impl CallScanner {
         reg_len: ArgReg,
         in_private: bool,
     ) -> bool {
-        if bytes.len() != self.secret_len {
+        if !SECRET_LENS.contains(&bytes.len()) {
             return false;
         }
         if !has_entropy(&bytes, MIN_DISTINCT_BYTES) {
