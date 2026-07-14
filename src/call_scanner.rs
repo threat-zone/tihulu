@@ -26,7 +26,6 @@ use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 
 use crate::memory_reader::{self, MemoryReader, PtrClass};
 
-
 /// Plausible TLS secret lengths to harvest. 32 covers SHA-256 TLS 1.3
 /// traffic secrets; 48 covers SHA-384 TLS 1.3 traffic secrets and the TLS 1.2
 /// master secret. The scanner arms before the cipher is negotiated, so it

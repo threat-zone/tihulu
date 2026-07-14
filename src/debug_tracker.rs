@@ -34,6 +34,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
+use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
 use windows::Win32::Foundation::*;
 use windows::Win32::Networking::WinSock::*;
 use windows::Win32::System::Diagnostics::Debug::*;
@@ -41,12 +43,14 @@ use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::Threading::*;
 
+use crate::call_scanner::{self, ArgReg, CallScanner, Phase as ScanPhase};
 use crate::memory_reader::MemoryReader;
 use crate::proxy::{ProxyEvent, ProxyManager};
 use crate::tls_decrypt;
-use crate::tls_parser::{hex_string, TlsParser, TLS13_CHTS, TLS13_CTS0, TLS13_SHTS, TLS13_STS0, TLS13_ALL};
+use crate::tls_parser::{
+    hex_string, TlsParser, TLS13_ALL, TLS13_CHTS, TLS13_CTS0, TLS13_SHTS, TLS13_STS0,
+};
 use crate::tls_types::*;
-use crate::call_scanner::{self, ArgReg, CallScanner, Phase as ScanPhase};
 
 /// Monotonic id assigned to every redirected connection. Shared across all
 /// trackers so ids are globally unique even under `--trace-children`.
@@ -55,7 +59,7 @@ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 macro_rules! dbg_log {
     ($self:expr, $($arg:tt)*) => {
         if $self.verbose {
-            eprintln!($($arg)*);
+            crate::logln!($($arg)*);
         }
     };
 }
@@ -175,16 +179,12 @@ enum PendingCall {
     /// CreateProcess{A,W,AsUserW}. The 10th argument (lpProcessInformation)
     /// is filled in by the time the call returns; we read dwProcessId from
     /// it and spawn a child Tihulu instance to monitor the new process.
-    CreateProcess {
-        process_info_ptr: u64,
-    },
+    CreateProcess { process_info_ptr: u64 },
     /// NtCreateUserProcess / ZwCreateUserProcess. The first argument is a
     /// PHANDLE that receives the new process handle (in the *target's*
     /// handle table); we resolve it to a PID at return time by duplicating
     /// the handle into our own process.
-    NtCreateUserProcess {
-        process_handle_ptr: u64,
-    },
+    NtCreateUserProcess { process_handle_ptr: u64 },
 }
 
 struct Breakpoint {
@@ -210,6 +210,10 @@ struct ConnectionState {
 struct ThreadState {
     /// Address of function breakpoint to re-set after single-step.
     restore_bp: Option<u64>,
+    /// Threads this thread explicitly suspended so it could single-step in
+    /// isolation. They are resumed once this thread's SINGLE_STEP completes
+    /// (or the thread exits). Empty when no step is in flight for this thread.
+    suspended_others: Vec<u32>,
 }
 
 // ============================================================================
@@ -242,6 +246,20 @@ pub struct DebugTracker {
     /// Used to handle "ghost" breakpoints from other threads that hit the
     /// INT3 between write and consume on a different thread.
     consumed_return_addrs: HashMap<u64, u8>,
+    /// CALL-probe sites that have been culled or bulk-disarmed → original byte.
+    /// A thread on another core can execute one of these INT3s in the window
+    /// before the byte is restored, or have its breakpoint event queued behind
+    /// the bulk disarm; either way the event is delivered after the site left
+    /// `breakpoints`. Without a record we would resume that thread at `addr+1`
+    /// — mid-instruction — and corrupt it. This lets the fall-through rewind
+    /// RIP so the thread re-executes the (already restored) real instruction.
+    retired_call_sites: HashMap<u64, u8>,
+    /// The thread currently executing a single-step in isolation (all other
+    /// threads frozen), if any. While set, a breakpoint event from any other
+    /// thread is deferred — re-armed and left frozen to re-hit later — rather
+    /// than starting a second, nested step. Nesting would deadlock: each
+    /// stepper would be frozen by the other and neither could run.
+    step_in_flight: Option<u32>,
     threads: HashMap<u32, ThreadState>,
     thread_handles: HashMap<u32, HANDLE>,
     /// User-specified output directory. Each tracked process writes its keys
@@ -261,6 +279,12 @@ pub struct DebugTracker {
     /// processes spawned by the target are also attached to in the same
     /// Tihulu instance. Off by default.
     trace_children: bool,
+    /// When true, keep intercepting connections after the first session's keys
+    /// are recovered: the connect hooks are re-armed each time a key-extraction
+    /// window closes, repeating the cycle until the target exits. When false
+    /// (the default), the connect hooks are left disarmed after the first key
+    /// search completes, so only one TLS session is captured.
+    continuous: bool,
     /// When true, the target process was launched in a suspended state by
     /// a parent Tihulu instance. Once all breakpoints have been installed
     /// the main thread is resumed exactly once.
@@ -304,6 +328,25 @@ pub struct DebugTracker {
     max_call_bps: usize,
     /// Whether the brute-force scan fallback is allowed when no candidate decrypts.
     fallback_scan: bool,
+    /// Whether the connect-family hooks (`connect`, `WSAConnect`, `ConnectEx`,
+    /// `WSAConnectByName{W,A}`) are currently installed. They are disarmed for
+    /// the duration of a key-extraction window so the target's new connections
+    /// are not redirected to the relay while we recover the current session's
+    /// keys, then re-armed once the keys are obtained.
+    connect_hooks_armed: bool,
+    /// True while we are actively recovering the keys for a detected TLS
+    /// connection: the CALL-probe scanner is armed, the connect hooks are
+    /// disarmed, and new relays are paused. Cleared once the keys are obtained
+    /// (or the triggering connection closes), after which the connect hooks are
+    /// re-armed and interception resumes.
+    key_extraction_active: bool,
+    /// Connection id that opened the current key-extraction window. The window
+    /// is closed only when this connection's key search completes or it closes.
+    key_extraction_conn: Option<u64>,
+    /// When true, `begin_relay` refuses to stand up new relays. Set while a
+    /// key-extraction window is open so no new connection is redirected to the
+    /// proxy until the current session's keys are recovered.
+    relay_paused: bool,
     _stop: Arc<AtomicBool>,
 }
 
@@ -322,23 +365,42 @@ impl DebugTracker {
         max_call_bps: usize,
         fallback_scan: bool,
         trace_children: bool,
+        continuous: bool,
         resume_on_attach: bool,
     ) -> Self {
-        let search_threads = search_threads
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
-        eprintln!("[*] Memory-scan threads: {}", search_threads);
-        eprintln!(
+        let search_threads = search_threads.filter(|&n| n > 0).unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
+        crate::logln!("[*] Memory-scan threads: {}", search_threads);
+        crate::logln!(
             "[*] CALL-probe scanner: {}, brute-force fallback: {}",
-            if call_probe_enabled { "enabled" } else { "disabled" },
+            if call_probe_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             if fallback_scan { "enabled" } else { "disabled" },
         );
-        eprintln!(
+        crate::logln!(
             "[*] Child-process tracing: {}",
-            if trace_children { "enabled" } else { "disabled" },
+            if trace_children {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        );
+        crate::logln!(
+            "[*] Capture mode: {}",
+            if continuous {
+                "continuous (keep intercepting after first key)"
+            } else {
+                "one-shot (stop intercepting after first key)"
+            },
         );
         if resume_on_attach {
-            eprintln!("[*] Target was started suspended — will resume after hook install");
+            crate::logln!("[*] Target was started suspended — will resume after hook install");
         }
         // Mirror the SSLKEYLOGFILE path injected into the target's env block
         // (see `launch_process` / `main::run_windows`): a target that honours
@@ -362,6 +424,8 @@ impl DebugTracker {
             proxy,
             proxy_rx,
             consumed_return_addrs: HashMap::new(),
+            retired_call_sites: HashMap::new(),
+            step_in_flight: None,
             threads: HashMap::new(),
             thread_handles: HashMap::new(),
             output_dir,
@@ -380,7 +444,12 @@ impl DebugTracker {
             call_probe_enabled,
             max_call_bps,
             fallback_scan,
+            connect_hooks_armed: true,
+            key_extraction_active: false,
+            key_extraction_conn: None,
+            relay_paused: false,
             trace_children,
+            continuous,
             resume_on_attach,
             main_thread_tid: None,
             resumed_on_attach: false,
@@ -417,23 +486,24 @@ impl DebugTracker {
         // copied environment block (via PEB → ProcessParameters → Environment)
         // and only then resume the main thread.
         const PID_PLACEHOLDER: &str = "0000000000"; // exactly 10 chars (u32::MAX = 4294967295)
-        // Resolve `output_dir` to a fully-qualified absolute path: the child
-        // process may inherit a different working directory than ours, so a
-        // relative `SSLKEYLOGFILE` would land in an unpredictable location
-        // (or fail to open at all). `std::path::absolute` performs purely
-        // lexical resolution against the current process's CWD without
-        // requiring the path to exist yet and — crucially on Windows —
-        // without prepending the `\\?\` extended-length prefix that
-        // `fs::canonicalize` adds (some runtimes refuse such paths).
+                                                    // Resolve `output_dir` to a fully-qualified absolute path: the child
+                                                    // process may inherit a different working directory than ours, so a
+                                                    // relative `SSLKEYLOGFILE` would land in an unpredictable location
+                                                    // (or fail to open at all). `std::path::absolute` performs purely
+                                                    // lexical resolution against the current process's CWD without
+                                                    // requiring the path to exist yet and — crucially on Windows —
+                                                    // without prepending the `\\?\` extended-length prefix that
+                                                    // `fs::canonicalize` adds (some runtimes refuse such paths).
         let key_path_template = output_dir.and_then(|dir| {
             let dir_path = std::path::Path::new(dir);
             let abs_dir = match std::path::absolute(dir_path) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!(
+                    crate::logln!(
                         "[!] Could not resolve absolute path for output dir '{}': {} \
                          — SSLKEYLOGFILE will not be injected",
-                        dir, e
+                        dir,
+                        e
                     );
                     return None;
                 }
@@ -483,10 +553,10 @@ impl DebugTracker {
                     // subsequent process spawns from Tihulu inherit the
                     // canonical filename rather than the placeholder.
                     std::env::set_var("SSLKEYLOGFILE", &final_path);
-                    eprintln!("[*] SSLKEYLOGFILE injected: {}", final_path);
+                    crate::logln!("[*] SSLKEYLOGFILE injected: {}", final_path);
                 }
                 Err(e) => {
-                    eprintln!(
+                    crate::logln!(
                         "[!] Failed to patch SSLKEYLOGFILE in child env: {} \
                          (child will use placeholder PID filename)",
                         e
@@ -553,8 +623,13 @@ impl DebugTracker {
                 let info = unsafe { &event.u.CreateProcessInfo };
                 self.process_handle = info.hProcess;
                 self.thread_handles.insert(event.dwThreadId, info.hThread);
-                self.threads
-                    .insert(event.dwThreadId, ThreadState { restore_bp: None });
+                self.threads.insert(
+                    event.dwThreadId,
+                    ThreadState {
+                        restore_bp: None,
+                        suspended_others: Vec::new(),
+                    },
+                );
                 if self.main_thread_tid.is_none() {
                     self.main_thread_tid = Some(event.dwThreadId);
                 }
@@ -567,29 +642,72 @@ impl DebugTracker {
                 if self.process_name.is_empty() {
                     self.process_name = query_process_image_name(self.process_handle)
                         .unwrap_or_else(|| format!("pid{}", self.pid));
-                    eprintln!("[*] Target process image: {} (PID {})", self.process_name, self.pid);
+                    crate::logln!(
+                        "[*] Target process image: {} (PID {})",
+                        self.process_name,
+                        self.pid
+                    );
                 }
-                dbg_log!(self, "[dbg] CREATE_PROCESS tid={} handle={:?} main_image=0x{:X}",
-                    event.dwThreadId, self.process_handle, self.main_image_base);
+                dbg_log!(
+                    self,
+                    "[dbg] CREATE_PROCESS tid={} handle={:?} main_image=0x{:X}",
+                    event.dwThreadId,
+                    self.process_handle,
+                    self.main_image_base
+                );
                 self.resolve_hook_addresses();
                 DBG_CONTINUE
             }
             CREATE_THREAD_DEBUG_EVENT => {
                 let info = unsafe { &event.u.CreateThread };
                 self.thread_handles.insert(event.dwThreadId, info.hThread);
-                self.threads
-                    .insert(event.dwThreadId, ThreadState { restore_bp: None });
+                self.threads.insert(
+                    event.dwThreadId,
+                    ThreadState {
+                        restore_bp: None,
+                        suspended_others: Vec::new(),
+                    },
+                );
+                // If a single-step is in flight, every other thread is meant to
+                // be frozen. A thread created now would otherwise run free until
+                // it first faults; freeze it up front and track it so it is
+                // released with the rest when the step completes.
+                if let Some(stepper) = self.step_in_flight {
+                    if stepper != event.dwThreadId {
+                        let prev = unsafe { SuspendThread(info.hThread) };
+                        if prev == u32::MAX {
+                            dbg_log!(
+                                self,
+                                "[dbg] step-suspend(new): SuspendThread({}) failed",
+                                event.dwThreadId
+                            );
+                        }
+                        if let Some(ts) = self.threads.get_mut(&stepper) {
+                            ts.suspended_others.push(event.dwThreadId);
+                        }
+                    }
+                }
                 DBG_CONTINUE
             }
             EXIT_THREAD_DEBUG_EVENT => {
-                eprintln!("[-] Thread exited: tid={} (PID {})", event.dwThreadId, self.pid);
+                crate::logln!(
+                    "[!] Thread exited: tid={} (PID {})",
+                    event.dwThreadId,
+                    self.pid
+                );
+                // If this thread died mid-step it may still hold other threads
+                // frozen; release them or they hang for the rest of the session.
+                self.resume_step_others(event.dwThreadId);
                 self.threads.remove(&event.dwThreadId);
                 self.thread_handles.remove(&event.dwThreadId);
                 DBG_CONTINUE
             }
             EXIT_PROCESS_DEBUG_EVENT => {
-                eprintln!("[-] Target process exited (PID {})", self.pid);
-                return EventOutcome { status: DBG_CONTINUE, finished: true };
+                crate::logln!("[!] Target process exited (PID {})", self.pid);
+                return EventOutcome {
+                    status: DBG_CONTINUE,
+                    finished: true,
+                };
             }
             EXCEPTION_DEBUG_EVENT => {
                 let info = unsafe { &event.u.Exception };
@@ -606,7 +724,8 @@ impl DebugTracker {
                 }
                 dbg_log!(self, "[dbg] LOAD_DLL base=0x{:X} name={}", base, name);
                 if base != 0 {
-                    self.loaded_modules.insert(base, LoadedModule { name, base });
+                    self.loaded_modules
+                        .insert(base, LoadedModule { name, base });
                 }
                 if !self.breakpoints_active {
                     if self.hook_addrs.is_none() {
@@ -616,7 +735,7 @@ impl DebugTracker {
                     dbg_log!(self, "[dbg] try_set_all_breakpoints => {}", result);
                     if result {
                         self.breakpoints_active = true;
-                        eprintln!("[+] All breakpoints installed (PID {})", self.pid);
+                        crate::logln!("[*] All breakpoints installed (PID {})", self.pid);
                         self.maybe_resume_on_attach();
                     }
                 }
@@ -634,14 +753,19 @@ impl DebugTracker {
             }
             _ => DBG_CONTINUE,
         };
-        EventOutcome { status, finished: false }
+        EventOutcome {
+            status,
+            finished: false,
+        }
     }
 
     /// Emit the end-of-session diagnostic for this tracker.
     pub(crate) fn finalize_summary(&mut self) {
         if !self.any_tls_seen {
-            eprintln!("[!] No TLS ClientHello was observed for PID {} during this session.",
-                self.pid);
+            crate::logln!(
+                "[!] No TLS ClientHello was observed for PID {} during this session.",
+                self.pid
+            );
         }
         // If the injected SSLKEYLOGFILE was created, the target honours the
         // NSS key-log convention and wrote its own secrets there in parallel
@@ -650,7 +774,7 @@ impl DebugTracker {
         // Wireshark. Nothing but the target ever creates this exact filename.
         if let Some(ref path) = self.sslkeylog_path {
             if path.exists() {
-                eprintln!(
+                crate::logln!(
                     "[+] Target PID {} honours SSLKEYLOGFILE — its own key log is at {}",
                     self.pid,
                     path.display(),
@@ -664,17 +788,17 @@ impl DebugTracker {
     // Exception handling
     // ------------------------------------------------------------------
 
-    fn handle_exception(
-        &mut self,
-        pid: u32,
-        tid: u32,
-        info: &EXCEPTION_DEBUG_INFO,
-    ) -> NTSTATUS {
+    fn handle_exception(&mut self, pid: u32, tid: u32, info: &EXCEPTION_DEBUG_INFO) -> NTSTATUS {
         let code = info.ExceptionRecord.ExceptionCode;
         let addr = info.ExceptionRecord.ExceptionAddress as u64;
 
         if code == EXCEPTION_BREAKPOINT {
-            dbg_log!(self, "[dbg] BREAKPOINT at 0x{:X} first_chance={}", addr, info.dwFirstChance);
+            dbg_log!(
+                self,
+                "[dbg] BREAKPOINT at 0x{:X} first_chance={}",
+                addr,
+                info.dwFirstChance
+            );
             // Determine breakpoint type without holding a borrow on self.
             let bp_info = self.breakpoints.get(&addr).map(|bp| {
                 let tag: u8 = match bp.kind {
@@ -689,11 +813,56 @@ impl DebugTracker {
             }
 
             if let Some((orig, tag)) = bp_info {
-                // Restore original byte so the instruction can execute.
-                write_mem(self.process_handle, addr, &[orig]);
+                // Serialize single-steps. If another thread is stepping in
+                // isolation, this event is from a thread whose INT3 fired in
+                // the multi-core window just before the step began. Leave the
+                // byte armed (still 0xCC) and only rewind RIP so the thread
+                // re-executes — and is fully processed — once the in-flight
+                // step completes. Starting a nested step here would deadlock
+                // both steppers.
+                if let Some(stepper) = self.step_in_flight {
+                    if stepper != tid {
+                        dbg_log!(
+                            self,
+                            "[dbg]   deferring BP at 0x{:X} tid={} (step in flight on {})",
+                            addr,
+                            tid,
+                            stepper
+                        );
+                        if let Some(&th) = self.thread_handles.get(&tid) {
+                            set_rip(th, addr);
+                        }
+                        // Freeze this thread until the step completes. Threads
+                        // that existed when the step began are already frozen,
+                        // but a thread created mid-step (Go spawns OS threads
+                        // during a handshake) is not — and if left running it
+                        // would spin: re-execute the still-armed INT3, re-fault,
+                        // be deferred again, starving the stepper's SINGLE_STEP
+                        // and hanging the target. Suspend it once and track it
+                        // so `resume_step_others` releases it with the rest.
+                        let already = self
+                            .threads
+                            .get(&stepper)
+                            .map(|ts| ts.suspended_others.contains(&tid))
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(&h) = self.thread_handles.get(&tid) {
+                                unsafe {
+                                    SuspendThread(h);
+                                }
+                            }
+                            if let Some(ts) = self.threads.get_mut(&stepper) {
+                                ts.suspended_others.push(tid);
+                            }
+                        }
+                        return DBG_CONTINUE;
+                    }
+                }
 
                 if tag == 0 {
                     // --- Function breakpoint ---
+                    // Restore the original byte so the instruction can execute.
+                    write_mem(self.process_handle, addr, &[orig]);
                     dbg_log!(self, "[dbg]   => function BP at 0x{:X}, dispatching", addr);
                     self.dispatch_function_bp(pid, tid, addr);
 
@@ -705,32 +874,72 @@ impl DebugTracker {
                     if let Some(ts) = self.threads.get_mut(&tid) {
                         ts.restore_bp = Some(addr);
                     }
+                    // Freeze the other threads so none run past this site while
+                    // its byte is restored; released when the step completes.
+                    self.suspend_others_for_step(tid);
                 } else if tag == 2 {
                     // --- CALL-probe breakpoint ---
+                    // Advance past the CALL by *emulating* it: compute the
+                    // target and return address and set them directly, leaving
+                    // the INT3 byte in place. This never un-arms the site and
+                    // never single-steps, so it needs no thread suspension —
+                    // which is what deadlocked heavily-threaded Go targets. The
+                    // byte is left as 0xCC (still armed) for the common path;
+                    // only cull / the rare emulation fallback rewrite it.
                     let cull = self.on_call_probe_hit(tid, addr);
+                    let th = self.thread_handles.get(&tid).copied();
+                    let emulated = match th {
+                        Some(h) => self.emulate_call_advance(h, addr, orig),
+                        None => false,
+                    };
                     if cull {
-                        // Permanently disarm this site. Byte is already restored.
+                        // Permanently disarm this site.
                         self.breakpoints.remove(&addr);
                         self.scanner.bps.remove(&addr);
+                        // Disarm the byte and remember it so an in-flight hit
+                        // from another core is recognised and RIP-rewound
+                        // rather than resumed mid-instruction.
+                        write_mem(self.process_handle, addr, &[orig]);
+                        self.retired_call_sites.insert(addr, orig);
                         flush_icache(self.process_handle, addr);
-                        if let Some(&th) = self.thread_handles.get(&tid) {
-                            set_rip(th, addr);
+                        if !emulated {
+                            // Fallback: rewind so the thread re-executes the
+                            // now-restored original CALL instead of stepping.
+                            if let Some(h) = th {
+                                set_rip(h, addr);
+                            }
                         }
+                    } else if emulated {
+                        // Nothing to do: the byte is still armed (0xCC) and the
+                        // thread has been advanced past the CALL.
                     } else {
-                        if let Some(&th) = self.thread_handles.get(&tid) {
-                            set_rip(th, addr);
-                            enable_trap_flag(th);
+                        // Emulation failed (rare CALL encoding). Fall back to the
+                        // classic restore -> single-step -> re-arm, in isolation.
+                        write_mem(self.process_handle, addr, &[orig]);
+                        flush_icache(self.process_handle, addr);
+                        if let Some(h) = th {
+                            set_rip(h, addr);
+                            enable_trap_flag(h);
                         }
                         if let Some(ts) = self.threads.get_mut(&tid) {
                             ts.restore_bp = Some(addr);
                         }
+                        self.suspend_others_for_step(tid);
                     }
                 } else {
                     // --- Return breakpoint ---
-                    dbg_log!(self, "[dbg]   => return BP at 0x{:X}, dispatching for tid={}", addr, tid);
+                    // Restore the original byte so the instruction can execute.
+                    write_mem(self.process_handle, addr, &[orig]);
+                    dbg_log!(
+                        self,
+                        "[dbg]   => return BP at 0x{:X}, dispatching for tid={}",
+                        addr,
+                        tid
+                    );
                     let mut bp = self.breakpoints.remove(&addr).unwrap();
                     // Extract the call for this thread from the calls list.
-                    let dispatched_call = if let BreakpointKind::Return { ref mut calls } = bp.kind {
+                    let dispatched_call = if let BreakpointKind::Return { ref mut calls } = bp.kind
+                    {
                         if let Some(pos) = calls.iter().position(|(t, _)| *t == tid) {
                             Some(calls.remove(pos))
                         } else {
@@ -770,6 +979,11 @@ impl DebugTracker {
                             }
                         }
                     }
+                    if has_remaining {
+                        // Freeze the other threads so none run past this site
+                        // while its byte is restored; released on step complete.
+                        self.suspend_others_for_step(tid);
+                    }
                 }
                 return DBG_CONTINUE;
             }
@@ -778,8 +992,34 @@ impl DebugTracker {
             // for a return breakpoint on a different thread. The byte was
             // already restored; we just need to rewind RIP.
             if let Some(&orig) = self.consumed_return_addrs.get(&addr) {
-                dbg_log!(self, "[dbg]   ghost return BP at 0x{:X}, rewinding RIP", addr);
+                dbg_log!(
+                    self,
+                    "[dbg]   ghost return BP at 0x{:X}, rewinding RIP",
+                    addr
+                );
                 // Ensure byte is still restored (belt-and-suspenders).
+                write_mem(self.process_handle, addr, &[orig]);
+                flush_icache(self.process_handle, addr);
+                if let Some(&th) = self.thread_handles.get(&tid) {
+                    set_rip(th, addr);
+                }
+                return DBG_CONTINUE;
+            }
+
+            // Retired CALL-probe site: this INT3 was one of ours but has since
+            // been culled or bulk-disarmed. A thread on another core hit it in
+            // the window before the byte was restored, or its breakpoint event
+            // was queued behind the disarm, so the event is delivered after the
+            // site left `breakpoints`. The byte is already restored; rewind RIP
+            // off the phantom INT3 so the thread re-executes the real
+            // instruction instead of resuming at addr+1 (mid-instruction).
+            if let Some(&orig) = self.retired_call_sites.get(&addr) {
+                dbg_log!(
+                    self,
+                    "[dbg]   retired CALL-probe BP at 0x{:X}, rewinding RIP",
+                    addr
+                );
+                // Belt-and-suspenders: ensure the original byte is in place.
                 write_mem(self.process_handle, addr, &[orig]);
                 flush_icache(self.process_handle, addr);
                 if let Some(&th) = self.thread_handles.get(&tid) {
@@ -798,13 +1038,24 @@ impl DebugTracker {
 
         if code == EXCEPTION_SINGLE_STEP {
             dbg_log!(self, "[dbg] SINGLE_STEP tid={}", tid);
-            // Re-set the function breakpoint after single-stepping past it.
-            if let Some(ts) = self.threads.get_mut(&tid) {
-                if let Some(bp_addr) = ts.restore_bp.take() {
+            // Re-set the breakpoint this thread stepped past. This must happen
+            // BEFORE releasing the threads frozen for the step, so none of them
+            // can execute the site while it is un-armed.
+            let bp_addr = self
+                .threads
+                .get_mut(&tid)
+                .and_then(|ts| ts.restore_bp.take());
+            if let Some(bp_addr) = bp_addr {
+                // Only re-arm if the site is still active: it may have been
+                // culled, bulk-disarmed, or consumed (last return call) by
+                // another thread's event handled while this thread stepped.
+                if self.breakpoints.contains_key(&bp_addr) {
                     write_mem(self.process_handle, bp_addr, &[0xCC]);
                     flush_icache(self.process_handle, bp_addr);
                 }
             }
+            // Release the threads frozen for this thread's single-step.
+            self.resume_step_others(tid);
             return DBG_CONTINUE;
         }
 
@@ -857,7 +1108,11 @@ impl DebugTracker {
             dbg_log!(self, "[dbg] => ZwCreateUserProcess()");
             self.on_nt_create_user_process_entry(tid, &ctx);
         } else {
-            dbg_log!(self, "[dbg] => unknown function BP at 0x{:X} (not matching any hook)", addr);
+            dbg_log!(
+                self,
+                "[dbg] => unknown function BP at 0x{:X} (not matching any hook)",
+                addr
+            );
         }
     }
 
@@ -886,16 +1141,19 @@ impl DebugTracker {
                 //                       DWORD dwProcessId(4), DWORD dwThreadId(4) }
                 let mut pi = [0u8; 24];
                 if !read_mem(self.process_handle, *process_info_ptr, &mut pi) {
-                    dbg_log!(self, "[dbg] CreateProcess: failed to read PROCESS_INFORMATION");
+                    dbg_log!(
+                        self,
+                        "[dbg] CreateProcess: failed to read PROCESS_INFORMATION"
+                    );
                     return;
                 }
                 let child_pid = u32::from_le_bytes([pi[16], pi[17], pi[18], pi[19]]);
                 if child_pid == 0 {
                     return;
                 }
-                eprintln!("[+] Target spawned child process PID {}", child_pid);
+                crate::logln!("[*] Target spawned child process PID {}", child_pid);
                 if !nudge_then_freeze_child(child_pid) {
-                    eprintln!(
+                    crate::logln!(
                         "[!] Could not dispatch+freeze child PID {} before attach — \
                         DebugActiveProcess may fail",
                         child_pid
@@ -908,7 +1166,11 @@ impl DebugTracker {
                 // failures, anything >= 0 is success.
                 let status = ctx.rax as i32;
                 if status < 0 {
-                    dbg_log!(self, "[dbg] NtCreateUserProcess returned 0x{:08X}", status as u32);
+                    dbg_log!(
+                        self,
+                        "[dbg] NtCreateUserProcess returned 0x{:08X}",
+                        status as u32
+                    );
                     return;
                 }
                 // Read the new HANDLE (8 bytes) from the out-pointer.
@@ -926,9 +1188,12 @@ impl DebugTracker {
                 let child_pid = duplicate_and_get_pid(self.process_handle, target_handle);
                 match child_pid {
                     Some(pid) => {
-                        eprintln!("[+] Target spawned child process PID {} (via NtCreateUserProcess)", pid);
+                        crate::logln!(
+                            "[*] Target spawned child process PID {} (via NtCreateUserProcess)",
+                            pid
+                        );
                         if !nudge_then_freeze_child(pid) {
-                            eprintln!(
+                            crate::logln!(
                                 "[!] Could not dispatch+freeze child PID {} before attach — \
                                 DebugActiveProcess may fail",
                                 pid
@@ -954,15 +1219,33 @@ impl DebugTracker {
     /// should be redirected to. Returns `None` if the relay could not be
     /// started (the caller should then leave the original destination intact).
     fn begin_relay(&mut self, dest: SocketAddr) -> Option<u16> {
+        // While a key-extraction window is open the connect hooks are disarmed
+        // and new connections must not be redirected to the relay. Guard here
+        // too in case a connect breakpoint was already in flight when the
+        // window opened — leaving the original destination intact makes the
+        // target connect out directly rather than through the paused proxy.
+        if self.relay_paused {
+            dbg_log!(
+                self,
+                "[dbg] relay paused (key-extraction window open) — {} left unproxied",
+                dest
+            );
+            return None;
+        }
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         let port = match self.proxy.start_connection(conn_id, dest) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[!] failed to start proxy relay for {}: {}", dest, e);
+                crate::logln!("[!] failed to start proxy relay for {}: {}", dest, e);
                 return None;
             }
         };
-        eprintln!("[*] {} -> proxy 127.0.0.1:{} (conn {})", dest, port, conn_id);
+        crate::logln!(
+            "[*] {} -> proxy 127.0.0.1:{} (conn {})",
+            dest,
+            port,
+            conn_id
+        );
         self.connections.insert(
             conn_id,
             ConnectionState {
@@ -974,18 +1257,12 @@ impl DebugTracker {
             },
         );
 
-        // Arm the CALL-probe scanner right here — synchronously, while the
-        // target is frozen servicing this connect breakpoint and *before* it
-        // performs the TLS handshake. Arming off the parsed ClientHello would
-        // be far too late: the relay forwards bytes to the real server without
-        // blocking the target, and the teed copy is parsed asynchronously on
-        // the orchestrator loop, so the target routinely completes the whole
-        // handshake (and even exits) before our parser ever observes the
-        // ClientHello. Servicing the connect BP is the earliest point that is
-        // synchronized with target execution and guaranteed to precede any TLS
-        // key derivation. No-op if already armed or call-probing is disabled.
-        self.arm_call_scanner();
-
+        // The CALL-probe scanner is deliberately *not* armed here. Arming on
+        // every relay connection also armed it for plain (non-TLS) traffic,
+        // which could surface spurious candidates on non-TLS connections.
+        // Instead the scanner is armed lazily once the first TLS ClientHello
+        // (and thus the first TLS_CLIENT_RANDOM) is observed for a connection —
+        // see `enter_key_extraction_window`, driven from `process_data`.
         Some(port)
     }
 
@@ -1008,7 +1285,11 @@ impl DebugTracker {
         let dest = match read_sockaddr(self.process_handle, sa_ptr, family) {
             Some(d) => d,
             None => {
-                dbg_log!(self, "[dbg] connect: unsupported/unreadable sockaddr (AF={})", family);
+                dbg_log!(
+                    self,
+                    "[dbg] connect: unsupported/unreadable sockaddr (AF={})",
+                    family
+                );
                 return;
             }
         };
@@ -1019,7 +1300,7 @@ impl DebugTracker {
         };
 
         if !write_redirect_sockaddr(self.process_handle, sa_ptr, port) {
-            eprintln!(
+            crate::logln!(
                 "[!] connect: failed to rewrite sockaddr — \
                  connection will reach {} unproxied",
                 dest
@@ -1049,14 +1330,18 @@ impl DebugTracker {
         {
             Some(p) => p,
             None => {
-                dbg_log!(self, "[dbg] WSAConnectByName: unrecognised service for {}, leaving unredirected", host);
+                dbg_log!(
+                    self,
+                    "[dbg] WSAConnectByName: unrecognised service for {}, leaving unredirected",
+                    host
+                );
                 return;
             }
         };
         let dest = match resolve_host(&host, port) {
             Some(d) => d,
             None => {
-                eprintln!("[!] WSAConnectByName: could not resolve {}:{}", host, port);
+                crate::logln!("[!] WSAConnectByName: could not resolve {}:{}", host, port);
                 return;
             }
         };
@@ -1070,19 +1355,29 @@ impl DebugTracker {
         let new_node = match alloc_string_in_target(self.process_handle, "127.0.0.1", wide) {
             Some(p) => p,
             None => {
-                eprintln!("[!] WSAConnectByName: VirtualAllocEx (nodename) failed — {} unproxied", dest);
+                crate::logln!(
+                    "[!] WSAConnectByName: VirtualAllocEx (nodename) failed — {} unproxied",
+                    dest
+                );
                 return;
             }
         };
-        let new_svc = match alloc_string_in_target(self.process_handle, &proxy_port.to_string(), wide) {
-            Some(p) => p,
-            None => {
-                eprintln!("[!] WSAConnectByName: VirtualAllocEx (servicename) failed — {} unproxied", dest);
-                return;
-            }
-        };
+        let new_svc =
+            match alloc_string_in_target(self.process_handle, &proxy_port.to_string(), wide) {
+                Some(p) => p,
+                None => {
+                    crate::logln!(
+                        "[!] WSAConnectByName: VirtualAllocEx (servicename) failed — {} unproxied",
+                        dest
+                    );
+                    return;
+                }
+            };
         if !set_rdx_r8(th, new_node, new_svc) {
-            eprintln!("[!] WSAConnectByName: failed to repoint arguments — {} unproxied", dest);
+            crate::logln!(
+                "[!] WSAConnectByName: failed to repoint arguments — {} unproxied",
+                dest
+            );
         }
     }
 
@@ -1106,8 +1401,12 @@ impl DebugTracker {
             return;
         }
         let ret_addr = u64::from_le_bytes(ret_bytes);
-        dbg_log!(self, "[dbg] CreateProcess: lpProcessInformation=0x{:X}, return BP at 0x{:X}",
-            process_info_ptr, ret_addr);
+        dbg_log!(
+            self,
+            "[dbg] CreateProcess: lpProcessInformation=0x{:X}, return BP at 0x{:X}",
+            process_info_ptr,
+            ret_addr
+        );
         if process_info_ptr == 0 {
             return;
         }
@@ -1130,8 +1429,12 @@ impl DebugTracker {
             return;
         }
         let ret_addr = u64::from_le_bytes(ret_bytes);
-        dbg_log!(self, "[dbg] CreateProcessAsUserW: lpProcessInformation=0x{:X}, return BP at 0x{:X}",
-            process_info_ptr, ret_addr);
+        dbg_log!(
+            self,
+            "[dbg] CreateProcessAsUserW: lpProcessInformation=0x{:X}, return BP at 0x{:X}",
+            process_info_ptr,
+            ret_addr
+        );
         if process_info_ptr == 0 {
             return;
         }
@@ -1170,8 +1473,12 @@ impl DebugTracker {
             return;
         }
         let ret_addr = u64::from_le_bytes(ret_bytes);
-        dbg_log!(self, "[dbg] NtCreateUserProcess: PHANDLE=0x{:X}, return BP at 0x{:X}",
-            process_handle_ptr, ret_addr);
+        dbg_log!(
+            self,
+            "[dbg] NtCreateUserProcess: PHANDLE=0x{:X}, return BP at 0x{:X}",
+            process_handle_ptr,
+            ret_addr
+        );
         if process_handle_ptr == 0 {
             return;
         }
@@ -1203,8 +1510,12 @@ impl DebugTracker {
         std::mem::take(&mut self.pending_child_attaches)
     }
 
-    pub(crate) fn pid(&self) -> u32 { self.pid }
-    pub(crate) fn is_done(&self) -> bool { self.should_detach && !self.detached }
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+    pub(crate) fn is_done(&self) -> bool {
+        self.should_detach && !self.detached
+    }
 
     /// Pull every pending byte/close event produced by this tracker's proxy
     /// relay threads and feed it through the TLS pipeline. Called once per
@@ -1219,6 +1530,13 @@ impl DebugTracker {
                 Ok(ProxyEvent::Closed { conn_id }) => {
                     if let Some(conn) = self.connections.remove(&conn_id) {
                         dbg_log!(self, "[dbg] conn {} closed ({})", conn_id, conn.dest);
+                    }
+                    // If the connection that opened the key-extraction window
+                    // closed before its keys were recovered, close the window so
+                    // the connect hooks are re-armed and interception resumes
+                    // rather than staying paused indefinitely.
+                    if self.key_extraction_conn == Some(conn_id) {
+                        self.exit_key_extraction_window();
                     }
                 }
                 Err(_) => break,
@@ -1241,12 +1559,13 @@ impl DebugTracker {
         }
         let st = unsafe { NtResumeProcess(self.process_handle) };
         if st < 0 {
-            eprintln!(
+            crate::logln!(
                 "[!] NtResumeProcess(PID {}) failed: 0x{:08X}",
-                self.pid, st as u32
+                self.pid,
+                st as u32
             );
         } else {
-            eprintln!("[+] Released suspended child process (PID {})", self.pid);
+            crate::logln!("[*] Released suspended child process (PID {})", self.pid);
         }
         self.resumed_on_attach = true;
     }
@@ -1274,9 +1593,18 @@ impl DebugTracker {
             conn.tls_checked = true;
             conn.is_tls = data.len() >= 3 && data[0] == 0x16 && data[1] == 0x03;
             if conn.is_tls {
-                dbg_log!(self, "[dbg] conn {}: TLS session initiation detected", conn_id);
+                dbg_log!(
+                    self,
+                    "[dbg] conn {}: TLS session initiation detected",
+                    conn_id
+                );
             } else {
-                dbg_log!(self, "[dbg] conn {}: first outbound bytes not TLS (0x{:02X}), relaying only", conn_id, data[0]);
+                dbg_log!(
+                    self,
+                    "[dbg] conn {}: first outbound bytes not TLS (0x{:02X}), relaying only",
+                    conn_id,
+                    data[0]
+                );
             }
         }
         if conn.tls_checked && !conn.is_tls {
@@ -1284,48 +1612,109 @@ impl DebugTracker {
         }
 
         let records = conn.parser.handle_data(data, dir);
-        dbg_log!(self, "[dbg] process_data: {} bytes {:?}, got {} records", data.len(), dir, records.len());
+        dbg_log!(
+            self,
+            "[dbg] process_data: {} bytes {:?}, got {} records",
+            data.len(),
+            dir,
+            records.len()
+        );
         for (r, d) in &records {
-            dbg_log!(self, "[dbg]   record type=0x{:02X} ver=0x{:04X} len={}", r.content_type, r.version, r.data.len());
+            dbg_log!(
+                self,
+                "[dbg]   record type=0x{:02X} ver=0x{:04X} len={}",
+                r.content_type,
+                r.version,
+                r.data.len()
+            );
             conn.parser.process_record(r, *d);
         }
 
         // Track at the DebugTracker level so it persists past closesocket.
-        // (The CALL-probe scanner is armed synchronously at connect time in
-        // `begin_relay`, not here — see the note there. By the time these teed
-        // bytes are parsed the target has usually already derived its keys, so
-        // this path is purely for observing the handshake and driving the
-        // secret search once enough records are captured.)
         if conn.parser.client_hello_seen {
             self.any_tls_seen = true;
         }
 
-        dbg_log!(self, "[dbg]   parser state: finished={} is_tls13={} has_cr={} has_sr={} cipher={:?}",
+        dbg_log!(
+            self,
+            "[dbg]   parser state: finished={} is_tls13={} has_cr={} has_sr={} cipher={:?}",
             conn.parser.finished,
             conn.parser.is_tls13,
             conn.parser.client_random != [0u8; 32],
             conn.parser.server_random != [0u8; 32],
             conn.parser.cipher_suite.map(|cs| cs.number),
         );
-        dbg_log!(self, "[dbg]   may_decrypt_tls12={} may_decrypt_tls13={}",
+        dbg_log!(
+            self,
+            "[dbg]   may_decrypt_tls12={} may_decrypt_tls13={}",
             conn.parser.may_decrypt_tls12(),
             conn.parser.may_decrypt_tls13(),
         );
 
-        if !self.connections.get(&key).map(|c| c.parser.finished).unwrap_or(true) {
-            let is_tls13 = self.connections.get(&key).map(|c| c.parser.is_tls13).unwrap_or(false);
-            let may13 = self.connections.get(&key).map(|c| c.parser.may_decrypt_tls13()).unwrap_or(false);
-            let found13 = self.connections.get(&key).map(|c| c.parser.tls13_found_secrets).unwrap_or(0);
-            let may12 = self.connections.get(&key).map(|c| c.parser.may_decrypt_tls12()).unwrap_or(false);
+        // As soon as the first TLS ClientHello (and thus the first
+        // TLS_CLIENT_RANDOM) is observed for this connection, open a
+        // key-extraction window: arm the CALL-probe scanner, disarm the connect
+        // hooks, and pause new relays. This replaces the old behaviour of
+        // arming the scanner on every relay connection (which also armed it for
+        // plain, non-TLS traffic). No-op if a window is already open.
+        if self
+            .connections
+            .get(&key)
+            .map(|c| c.parser.client_hello_seen)
+            .unwrap_or(false)
+        {
+            self.enter_key_extraction_window(conn_id);
+        }
+
+        if !self
+            .connections
+            .get(&key)
+            .map(|c| c.parser.finished)
+            .unwrap_or(true)
+        {
+            let is_tls13 = self
+                .connections
+                .get(&key)
+                .map(|c| c.parser.is_tls13)
+                .unwrap_or(false);
+            let may13 = self
+                .connections
+                .get(&key)
+                .map(|c| c.parser.may_decrypt_tls13())
+                .unwrap_or(false);
+            let found13 = self
+                .connections
+                .get(&key)
+                .map(|c| c.parser.tls13_found_secrets)
+                .unwrap_or(0);
+            let may12 = self
+                .connections
+                .get(&key)
+                .map(|c| c.parser.may_decrypt_tls12())
+                .unwrap_or(false);
             if is_tls13 {
                 if may13 && found13 != TLS13_ALL {
-                    eprintln!("[*] All TLS 1.3 records captured — triggering secret search");
+                    crate::logln!("[*] All TLS 1.3 records captured — triggering secret search");
                     self.find_tls13_secrets(conn_id);
                 }
             } else if may12 {
-                eprintln!("[*] triggering TLS 1.2 master secret search");
+                crate::logln!("[*] triggering TLS 1.2 master secret search");
                 self.find_master_secret(conn_id);
             }
+        }
+
+        // Once the connection that opened the key-extraction window has
+        // finished its key search (all secrets recovered, or the search gave
+        // up), close the window: re-arm the connect hooks and resume relaying
+        // new connections until the target process terminates.
+        if self.key_extraction_conn == Some(conn_id)
+            && self
+                .connections
+                .get(&key)
+                .map(|c| c.parser.finished)
+                .unwrap_or(true)
+        {
+            self.exit_key_extraction_window();
         }
     }
 
@@ -1349,7 +1738,7 @@ impl DebugTracker {
 
         // ---- Phase 1: try CALL-probe candidates first ----
         if self.call_probe_enabled && !self.scanner.candidates.is_empty() {
-            eprintln!(
+            crate::logln!(
                 "[*] TLS 1.2: trying {} CALL-probe candidate secret(s) ...",
                 self.scanner.candidates.len()
             );
@@ -1366,15 +1755,15 @@ impl DebugTracker {
                 if let Some(c) = self.connections.get_mut(&key) {
                     c.parser.finished = true;
                 }
-                eprintln!("[+] Master secret found via CALL-probe!");
+                crate::logln!("[+] Master secret found via CALL-probe!");
                 return;
             }
-            eprintln!("[-] No CALL-probe candidate decrypted TLS 1.2 record");
+            crate::logln!("[!] No CALL-probe candidate decrypted TLS 1.2 record");
         }
 
         if !self.fallback_scan {
-            eprintln!(
-                "[-] Master secret not recovered; brute-force fallback disabled \
+            crate::logln!(
+                "[!] Master secret not recovered; brute-force fallback disabled \
                  (pass --fallback-scan to enable)"
             );
             if let Some(c) = self.connections.get_mut(&key) {
@@ -1383,11 +1772,16 @@ impl DebugTracker {
             return;
         }
 
-        eprintln!("[*] Falling back to brute-force memory scan for master secret ...");
+        crate::logln!("[*] Falling back to brute-force memory scan for master secret ...");
         self.suspend_target();
         let reader = MemoryReader::new(handle, self.pid);
         let regions = reader.get_memory_regions();
-        dbg_log!(self, "[dbg] scanning {} memory regions across {} threads", regions.len(), self.search_threads);
+        dbg_log!(
+            self,
+            "[dbg] scanning {} memory regions across {} threads",
+            regions.len(),
+            self.search_threads
+        );
 
         // Parallelize across regions: each worker thread claims a region,
         // reads it, and scans it for a candidate master secret. `find_map_any`
@@ -1410,8 +1804,13 @@ impl DebugTracker {
                 if mem.len() < SSL_MASTER_SECRET_LENGTH {
                     return None;
                 }
-                dbg_log!(self, "[dbg] searching region 0x{:X}-0x{:X} (size={}) for master secret",
-                    region.base, region.base + region.size as u64, mem.len());
+                dbg_log!(
+                    self,
+                    "[dbg] searching region 0x{:X}-0x{:X} (size={}) for master secret",
+                    region.base,
+                    region.base + region.size as u64,
+                    mem.len()
+                );
                 let range = mem.len() + 1 - SSL_MASTER_SECRET_LENGTH;
                 for i in 0..range {
                     if tls_decrypt::try_decrypt_tls12(
@@ -1444,9 +1843,9 @@ impl DebugTracker {
         }
         self.resume_target();
         if found {
-            eprintln!("[+] Master secret found!");
-        } else { 
-            eprintln!("[-] Warning: master secret not found");
+            crate::logln!("[+] Master secret found!");
+        } else {
+            crate::logln!("[!] Warning: master secret not found");
         }
     }
 
@@ -1470,7 +1869,12 @@ impl DebugTracker {
         let mut targets: Vec<(&'static str, TlsRecord, u64, u8)> = Vec::new();
         if already_found & TLS13_CHTS == 0 {
             if let Some(ref rec) = conn.parser.tls13_client_finished {
-                targets.push(("CLIENT_HANDSHAKE_TRAFFIC_SECRET", rec.clone(), 0, TLS13_CHTS));
+                targets.push((
+                    "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+                    rec.clone(),
+                    0,
+                    TLS13_CHTS,
+                ));
             }
         }
         if already_found & TLS13_CTS0 == 0 {
@@ -1480,7 +1884,12 @@ impl DebugTracker {
         }
         if already_found & TLS13_SHTS == 0 {
             if let Some(ref rec) = conn.parser.tls13_server_encrypted {
-                targets.push(("SERVER_HANDSHAKE_TRAFFIC_SECRET", rec.clone(), 0, TLS13_SHTS));
+                targets.push((
+                    "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+                    rec.clone(),
+                    0,
+                    TLS13_SHTS,
+                ));
             }
         }
         if already_found & TLS13_STS0 == 0 {
@@ -1494,7 +1903,7 @@ impl DebugTracker {
 
         // ---- Phase 1: try CALL-probe candidates first ----
         if self.call_probe_enabled && !self.scanner.candidates.is_empty() {
-            eprintln!(
+            crate::logln!(
                 "[*] TLS 1.3: trying {} CALL-probe candidate secret(s) across {} target record(s) ...",
                 self.scanner.candidates.len(),
                 targets.len(),
@@ -1508,12 +1917,12 @@ impl DebugTracker {
             for (label, record, seq, mask) in targets {
                 match self.trial_tls13_candidates(cs, &record, seq) {
                     Some(secret) => {
-                        eprintln!("[+] [{}] found via CALL-probe", label);
+                        crate::logln!("[+] [{}] found via CALL-probe", label);
                         newly_found |= mask;
                         findings.push((label, secret));
                     }
                     None => {
-                        eprintln!("[-] [{}] no CALL-probe candidate decrypted", label);
+                        crate::logln!("[-] [{}] no CALL-probe candidate decrypted", label);
                         remaining.push((label, record, seq, mask));
                     }
                 }
@@ -1531,7 +1940,7 @@ impl DebugTracker {
                 c.parser.tls13_found_secrets |= newly_found;
                 if c.parser.tls13_found_secrets == TLS13_ALL {
                     c.parser.finished = true;
-                    eprintln!("[+] All TLS 1.3 secrets found via CALL-probe!");
+                    crate::logln!("[+] All TLS 1.3 secrets found via CALL-probe!");
                 }
             }
             self.resume_target();
@@ -1540,8 +1949,8 @@ impl DebugTracker {
                 return;
             }
             if !self.fallback_scan {
-                eprintln!(
-                    "[-] {} TLS 1.3 secret(s) not recovered via CALL-probe; brute-force \
+                crate::logln!(
+                    "[!] {} TLS 1.3 secret(s) not recovered via CALL-probe; brute-force \
                      fallback disabled (pass --fallback-scan to enable)",
                     remaining.len()
                 );
@@ -1551,7 +1960,7 @@ impl DebugTracker {
                 }
                 return;
             }
-            eprintln!(
+            crate::logln!(
                 "[*] Falling back to brute-force scan for {} remaining target(s) ...",
                 remaining.len()
             );
@@ -1562,8 +1971,8 @@ impl DebugTracker {
         }
 
         if !self.fallback_scan {
-            eprintln!(
-                "[-] No CALL-probe candidates collected; brute-force fallback disabled \
+            crate::logln!(
+                "[!] No CALL-probe candidates collected; brute-force fallback disabled \
                  (pass --fallback-scan to enable)"
             );
             if let Some(c) = self.connections.get_mut(&key) {
@@ -1591,7 +2000,7 @@ impl DebugTracker {
             .map(|c| c.parser.tls13_found_secrets)
             .unwrap_or(0);
 
-        eprintln!(
+        crate::logln!(
             "[*] Brute-force TLS 1.3 scan: {} targets, {}/4 found so far, {} worker threads ...",
             targets.len(),
             already_found.count_ones(),
@@ -1609,7 +2018,9 @@ impl DebugTracker {
         dbg_log!(
             self,
             "[dbg] {} memory sections (size >= {}), using {} worker threads",
-            sections.len(), slen, self.search_threads
+            sections.len(),
+            slen,
+            self.search_threads
         );
 
         // --- Shared state between the 4 main scan threads ---
@@ -1673,7 +2084,7 @@ impl DebugTracker {
                 let mut scanned = vec![false; n];
                 let mut cursor: usize = 0;
 
-                eprintln!("[*] [{}] search started", label);
+                crate::logln!("[*] [{}] search started", label);
 
                 loop {
                     // Pick the next section to scan. Hinted sections (from
@@ -1712,9 +2123,11 @@ impl DebugTracker {
                     // Clear any stale cancel signal before starting this section.
                     my_ctrl.cancel.store(false, Ordering::Relaxed);
                     if verbose {
-                        eprintln!(
+                        crate::logln!(
                             "[dbg] [{}] scanning section {} (size=0x{:X})",
-                            label, si, sec.len()
+                            label,
+                            si,
+                            sec.len()
                         );
                     }
 
@@ -1725,9 +2138,7 @@ impl DebugTracker {
                             // Check for cancellation every 16384 iterations to
                             // amortize the atomic load. On cancel, bail out of
                             // the whole par_iter by returning Some(Cancelled).
-                            if (k & 0x3FFF) == 0
-                                && ctrl_ref.cancel.load(Ordering::Relaxed)
-                            {
+                            if (k & 0x3FFF) == 0 && ctrl_ref.cancel.load(Ordering::Relaxed) {
                                 return Some(ScanOut::Cancelled);
                             }
                             if tls_decrypt::try_decrypt_tls13(
@@ -1745,9 +2156,11 @@ impl DebugTracker {
 
                     match out {
                         Some(ScanOut::Found(off)) => {
-                            eprintln!(
+                            crate::logln!(
                                 "[+] [{}] found at section {} offset 0x{:X}",
-                                label, si, off
+                                label,
+                                si,
+                                off
                             );
                             // Broadcast the winning section index to every
                             // other target so they try this section next.
@@ -1765,10 +2178,11 @@ impl DebugTracker {
                             // queue so we return to it after consuming any
                             // pending hints, and loop.
                             if verbose {
-                                eprintln!(
+                                crate::logln!(
                                     "[dbg] [{}] scan of section {} cancelled by hint, \
                                      will retry later",
-                                    label, si
+                                    label,
+                                    si
                                 );
                             }
                             scanned[si] = false;
@@ -1780,7 +2194,7 @@ impl DebugTracker {
                     }
                 }
 
-                eprintln!("[-] [{}] not found", label);
+                crate::logln!("[!] [{}] not found", label);
                 None
             }));
         }
@@ -1809,7 +2223,7 @@ impl DebugTracker {
             // Mark finished only when all 4 secrets have been found.
             if c.parser.tls13_found_secrets == TLS13_ALL {
                 c.parser.finished = true;
-                eprintln!("[+] All TLS 1.3 secrets found!");
+                crate::logln!("[+] All TLS 1.3 secrets found!");
             }
         }
         dbg_log!(
@@ -1817,7 +2231,7 @@ impl DebugTracker {
             "[dbg] TLS 1.3 secret search complete: {}/4 secrets found",
             (already_found | newly_found).count_ones()
         );
-        eprintln!("[*] Resuming target process");
+        crate::logln!("[*] Resuming target process");
         self.resume_target();
     }
 
@@ -1835,7 +2249,7 @@ impl DebugTracker {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                eprintln!("[*] Writing keys to {}", path.display());
+                crate::logln!("[*] Writing keys to {}", path.display());
                 self.output_path = Some(path);
             }
             if let Some(ref path) = self.output_path {
@@ -1855,9 +2269,10 @@ impl DebugTracker {
         }
 
         if wrote_to_file {
-            // First successful extraction triggers an orderly detach so the
-            // target process keeps running without our breakpoints.
-            self.should_detach = true;
+            // The tool no longer detaches after the first extraction: it stays
+            // attached, re-arms the connect hooks once the current session's
+            // keys are recovered (see `exit_key_extraction_window`), and keeps
+            // intercepting new TLS connections until the target terminates.
         }
     }
 
@@ -1876,18 +2291,28 @@ impl DebugTracker {
         if self.scanner.is_armed() {
             return;
         }
-        eprintln!(
+        crate::logln!(
             "[*] Arming CALL-probe scanner (harvesting secret lengths {:?})",
             call_scanner::SECRET_LENS
         );
         self.scanner = CallScanner::new(self.verbose);
         self.scanner.phase = ScanPhase::Harvesting;
+        // Sites retired in a previous window are about to be re-armed with
+        // fresh INT3s tracked in `breakpoints`; drop the stale retirement
+        // records so they can't shadow the new arming and the map stays
+        // bounded across windows. Any in-flight hits from the prior window
+        // have long since been drained before a new window opens.
+        self.retired_call_sites.clear();
 
         self.suspend_target();
         let reader = MemoryReader::new(self.process_handle, self.pid);
         self.scanner.refresh_ranges(&reader);
         let exec_regions = reader.get_executable_regions();
-        dbg_log!(self, "[dbg] scanner: {} executable regions", exec_regions.len());
+        dbg_log!(
+            self,
+            "[dbg] scanner: {} executable regions",
+            exec_regions.len()
+        );
 
         // Probe every executable region in the process — no module allow-list.
         let mut sites: Vec<u64> = Vec::new();
@@ -1902,14 +2327,14 @@ impl DebugTracker {
             }
         }
         if sites.len() > self.max_call_bps {
-            eprintln!(
+            crate::logln!(
                 "[!] scanner: truncating {} CALL sites to cap of {}",
                 sites.len(),
                 self.max_call_bps,
             );
             sites.truncate(self.max_call_bps);
         }
-        eprintln!("[*] scanner: arming {} CALL breakpoints", sites.len());
+        crate::logln!("[*] scanner: arming {} CALL breakpoints", sites.len());
 
         let mut installed = 0usize;
         for ip in sites {
@@ -1942,7 +2367,7 @@ impl DebugTracker {
         }
         // Flush i-cache once across the whole process after bulk writes.
         flush_icache(self.process_handle, 0);
-        eprintln!("[+] scanner: {} CALL breakpoints installed", installed);
+        crate::logln!("[*] scanner: {} CALL breakpoints installed", installed);
         self.resume_target();
     }
 
@@ -1958,6 +2383,7 @@ impl DebugTracker {
         for addr in &sites {
             if let Some(bp) = self.breakpoints.remove(addr) {
                 write_mem(self.process_handle, *addr, &[bp.original_byte]);
+                self.retired_call_sites.insert(*addr, bp.original_byte);
             }
         }
         flush_icache(self.process_handle, 0);
@@ -1965,7 +2391,7 @@ impl DebugTracker {
         let n = self.scanner.bps.len();
         self.scanner.bps.clear();
         self.scanner.phase = ScanPhase::Done;
-        eprintln!("[*] scanner: disarmed {} CALL breakpoints", n);
+        crate::logln!("[*] scanner: disarmed {} CALL breakpoints", n);
     }
 
     /// Variant used by the trial-decrypt path: the caller has already
@@ -1980,12 +2406,209 @@ impl DebugTracker {
         for addr in &sites {
             if let Some(bp) = self.breakpoints.remove(addr) {
                 write_mem(self.process_handle, *addr, &[bp.original_byte]);
+                self.retired_call_sites.insert(*addr, bp.original_byte);
             }
         }
         flush_icache(self.process_handle, 0);
         self.scanner.bps.clear();
         self.scanner.phase = ScanPhase::Done;
-        eprintln!("[*] scanner: disarmed {} CALL breakpoints", n);
+        crate::logln!("[*] scanner: disarmed {} CALL breakpoints", n);
+    }
+
+    // ------------------------------------------------------------------
+    // Key-extraction window: connect-hook arm/disarm + relay pause
+    // ------------------------------------------------------------------
+
+    /// Addresses of the connect-family function hooks (`connect`, `WSAConnect`,
+    /// `ConnectEx`, `WSAConnectByName{W,A}`). Zeroed/unresolved entries are
+    /// filtered out. Does NOT include the CreateProcess-family hooks.
+    fn connect_hook_addrs(&self) -> Vec<u64> {
+        match &self.hook_addrs {
+            Some(a) => [
+                a.connect,
+                a.wsaconnect,
+                a.connect_ex,
+                a.wsa_connect_by_name_w,
+                a.wsa_connect_by_name_a,
+            ]
+            .into_iter()
+            .filter(|&addr| addr != 0)
+            .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Remove every connect-family function breakpoint so the target's new
+    /// connections are no longer redirected to the loopback relay. Leaves the
+    /// CALL-probe and CreateProcess hooks untouched.
+    fn disarm_connect_hooks(&mut self) {
+        if !self.connect_hooks_armed {
+            return;
+        }
+        let addrs = self.connect_hook_addrs();
+        self.suspend_target();
+        let mut removed = 0usize;
+        for addr in addrs {
+            // Only restore hooks we own as plain function breakpoints — never
+            // clobber a CALL-probe or return breakpoint that happens to share
+            // the address.
+            if matches!(
+                self.breakpoints.get(&addr).map(|b| &b.kind),
+                Some(BreakpointKind::Function)
+            ) {
+                if let Some(bp) = self.breakpoints.remove(&addr) {
+                    write_mem(self.process_handle, addr, &[bp.original_byte]);
+                    removed += 1;
+                }
+            }
+        }
+        flush_icache(self.process_handle, 0);
+        self.resume_target();
+        self.connect_hooks_armed = false;
+        crate::logln!(
+            "[*] Disarmed {} connect hook(s) — pausing new relays",
+            removed
+        );
+    }
+
+    /// Re-install the connect-family function breakpoints removed by
+    /// [`Self::disarm_connect_hooks`], resuming interception of new connections.
+    fn rearm_connect_hooks(&mut self) {
+        if self.connect_hooks_armed {
+            return;
+        }
+        let addrs = self.connect_hook_addrs();
+        self.suspend_target();
+        let mut installed = 0usize;
+        for addr in addrs {
+            if self.set_function_breakpoint(addr) {
+                installed += 1;
+            }
+        }
+        self.resume_target();
+        self.connect_hooks_armed = true;
+        crate::logln!(
+            "[*] Re-armed {} connect hook(s) — resuming relay interception",
+            installed
+        );
+    }
+
+    /// Open a key-extraction window for `conn_id`: arm the CALL-probe scanner
+    /// (now that a real TLS handshake is confirmed), disarm the connect hooks,
+    /// and pause new relays. No-op if a window is already open.
+    fn enter_key_extraction_window(&mut self, conn_id: u64) {
+        if self.key_extraction_active {
+            return;
+        }
+        self.key_extraction_active = true;
+        self.key_extraction_conn = Some(conn_id);
+        crate::logln!(
+            "[*] First TLS ClientHello observed on conn {} — arming CALL-probe scanner, \
+             disarming connect hooks, pausing new relays",
+            conn_id
+        );
+        self.arm_call_scanner();
+        self.disarm_connect_hooks();
+        self.relay_paused = true;
+    }
+
+    /// Close the current key-extraction window. In continuous mode the connect
+    /// hooks are re-armed and relaying resumes so the next TLS session is
+    /// captured; otherwise (one-shot, the default) the hooks are left disarmed
+    /// and no new connections are intercepted. The CALL-probe scanner has
+    /// already been disarmed by the trial-decrypt path. No-op if no window is
+    /// open.
+    fn exit_key_extraction_window(&mut self) {
+        if !self.key_extraction_active {
+            return;
+        }
+        let conn = self.key_extraction_conn;
+        self.key_extraction_active = false;
+        self.key_extraction_conn = None;
+        self.relay_paused = false;
+        if self.continuous {
+            crate::logln!(
+                "[*] Key search for conn {:?} complete — re-arming connect hooks, resuming relays",
+                conn
+            );
+            self.rearm_connect_hooks();
+        } else {
+            crate::logln!(
+                "[*] Key search for conn {:?} complete — one-shot mode, leaving connect hooks \
+                 disarmed (pass -c/--continue to keep intercepting new sessions)",
+                conn
+            );
+        }
+    }
+
+    /// Advance thread `th` past the CALL instruction at `addr` by emulating
+    /// it — push the return address and set RIP to the call target — instead
+    /// of restoring the byte and single-stepping. `orig` is the saved original
+    /// first byte (our INT3 overwrote it). Because the instruction is always a
+    /// CALL (that is the only thing the scanner arms), we can compute its
+    /// effect directly and leave the INT3 in place, so the site is never
+    /// un-armed and no other thread must be suspended.
+    ///
+    /// Returns false if the instruction can't be decoded or its target can't
+    /// be resolved (segment-relative operand, 32-bit addressing, unreadable
+    /// pointer); the caller then falls back to single-stepping.
+    fn emulate_call_advance(&self, th: HANDLE, addr: u64, orig: u8) -> bool {
+        // Read enough bytes for the longest CALL encoding, then restore the
+        // saved first byte so the decoder sees the real instruction, not 0xCC.
+        let mut buf = [0u8; 16];
+        if !read_mem(self.process_handle, addr, &mut buf) {
+            return false;
+        }
+        buf[0] = orig;
+        let mut dec = Decoder::with_ip(64, &buf, addr, DecoderOptions::NONE);
+        if !dec.can_decode() {
+            return false;
+        }
+        let insn = dec.decode();
+        if insn.is_invalid() || insn.mnemonic() != Mnemonic::Call {
+            return false;
+        }
+        let ctx = match get_ctx(th) {
+            Some(c) => c,
+            None => return false,
+        };
+        let target: u64 = match insn.op0_kind() {
+            OpKind::NearBranch64 => insn.near_branch_target(),
+            OpKind::Register => match reg_value(&ctx, insn.op0_register()) {
+                Some(v) => v,
+                None => return false,
+            },
+            OpKind::Memory => {
+                // A segment override would need a segment base we don't model.
+                if matches!(insn.memory_segment(), Register::FS | Register::GS) {
+                    return false;
+                }
+                let ea = match effective_address(&insn, &ctx) {
+                    Some(ea) => ea,
+                    None => return false,
+                };
+                let mut p = [0u8; 8];
+                if !read_mem(self.process_handle, ea, &mut p) {
+                    return false;
+                }
+                u64::from_le_bytes(p)
+            }
+            _ => return false,
+        };
+        if target == 0 {
+            return false;
+        }
+        // Push the return address and redirect RIP to the target — exactly what
+        // executing the CALL would do — without touching the INT3 byte.
+        let ret_addr = addr.wrapping_add(insn.len() as u64);
+        let new_rsp = ctx.rsp.wrapping_sub(8);
+        if !write_mem(self.process_handle, new_rsp, &ret_addr.to_le_bytes()) {
+            return false;
+        }
+        let mut newctx = ctx;
+        newctx.rsp = new_rsp;
+        newctx.rip = target;
+        set_ctx(th, &newctx)
     }
 
     /// Called on each CALL-probe breakpoint hit. Returns true if the site
@@ -2032,11 +2655,19 @@ impl DebugTracker {
                 if !read_mem(self.process_handle, v, &mut buf) {
                     continue;
                 }
-                if self.scanner.record_candidate(buf, v, addr, rp, rl, in_private) {
+                if self
+                    .scanner
+                    .record_candidate(buf, v, addr, rp, rl, in_private)
+                {
                     dbg_log!(
                         self,
                         "[dbg] candidate @ call=0x{:X} ptr={:?}=0x{:X} ({}) len={} len_reg={:?}",
-                        addr, rp, v, if in_private { "priv" } else { "shared" }, slen, rl
+                        addr,
+                        rp,
+                        v,
+                        if in_private { "priv" } else { "shared" },
+                        slen,
+                        rl
                     );
                 }
             }
@@ -2064,12 +2695,13 @@ impl DebugTracker {
             push(self.main_image_base);
         }
         for m in self.loaded_modules.values() {
-            let short = m.name.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(&m.name);
-            if call_scanner::module_is_allowlisted(
-                short,
-                call_scanner::DEFAULT_TLS_MODULES,
-                false,
-            ) {
+            let short = m
+                .name
+                .rsplit(|c| c == '\\' || c == '/')
+                .next()
+                .unwrap_or(&m.name);
+            if call_scanner::module_is_allowlisted(short, call_scanner::DEFAULT_TLS_MODULES, false)
+            {
                 push(m.base);
             }
         }
@@ -2147,27 +2779,29 @@ impl DebugTracker {
             let wbna = GetProcAddress(ws2, windows::core::s!("WSAConnectByNameA"));
             let cpw = GetProcAddress(k32, windows::core::s!("CreateProcessW"));
             let cpa = GetProcAddress(k32, windows::core::s!("CreateProcessA"));
-            let cpau = adv32.and_then(|h| GetProcAddress(h, windows::core::s!("CreateProcessAsUserW")));
-            let ntcup = ntdll.and_then(|h| GetProcAddress(h, windows::core::s!("NtCreateUserProcess")));
-            let zwcup = ntdll.and_then(|h| GetProcAddress(h, windows::core::s!("ZwCreateUserProcess")));
+            let cpau =
+                adv32.and_then(|h| GetProcAddress(h, windows::core::s!("CreateProcessAsUserW")));
+            let ntcup =
+                ntdll.and_then(|h| GetProcAddress(h, windows::core::s!("NtCreateUserProcess")));
+            let zwcup =
+                ntdll.and_then(|h| GetProcAddress(h, windows::core::s!("ZwCreateUserProcess")));
             // ConnectEx has no stable name export; resolve it through
             // WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER) in our own process.
             let connect_ex = resolve_connect_ex().unwrap_or(0);
             let wsa_connect_by_name_w = wbnw.map(|f| f as u64).unwrap_or(0);
             let wsa_connect_by_name_a = wbna.map(|f| f as u64).unwrap_or(0);
-            if let (Some(c), Some(wc)) = (c, wc)
-            {
-                eprintln!("Resolved hooks:");
-                eprintln!("  connect    = 0x{:X}", c as u64);
-                eprintln!("  WSAConnect = 0x{:X}", wc as u64);
+            if let (Some(c), Some(wc)) = (c, wc) {
+                crate::logln!("Resolved hooks:");
+                crate::logln!("  connect    = 0x{:X}", c as u64);
+                crate::logln!("  WSAConnect = 0x{:X}", wc as u64);
                 if connect_ex != 0 {
-                    eprintln!("  ConnectEx  = 0x{:X}", connect_ex);
+                    crate::logln!("  ConnectEx  = 0x{:X}", connect_ex);
                 }
                 if wsa_connect_by_name_w != 0 {
-                    eprintln!("  WSAConnectByNameW = 0x{:X}", wsa_connect_by_name_w);
+                    crate::logln!("  WSAConnectByNameW = 0x{:X}", wsa_connect_by_name_w);
                 }
                 if wsa_connect_by_name_a != 0 {
-                    eprintln!("  WSAConnectByNameA = 0x{:X}", wsa_connect_by_name_a);
+                    crate::logln!("  WSAConnectByNameA = 0x{:X}", wsa_connect_by_name_a);
                 }
                 let create_process_w = cpw.map(|f| f as u64).unwrap_or(0);
                 let create_process_a = cpa.map(|f| f as u64).unwrap_or(0);
@@ -2175,21 +2809,21 @@ impl DebugTracker {
                 let nt_create_user_process = ntcup.map(|f| f as u64).unwrap_or(0);
                 let zw_create_user_process = zwcup.map(|f| f as u64).unwrap_or(0);
                 if create_process_w != 0 {
-                    eprintln!("  CreateProcessW = 0x{:X}", create_process_w);
+                    crate::logln!("  CreateProcessW = 0x{:X}", create_process_w);
                 }
                 if create_process_a != 0 {
-                    eprintln!("  CreateProcessA = 0x{:X}", create_process_a);
+                    crate::logln!("  CreateProcessA = 0x{:X}", create_process_a);
                 }
                 if create_process_as_user_w != 0 {
-                    eprintln!("  CreateProcessAsUserW = 0x{:X}", create_process_as_user_w);
+                    crate::logln!("  CreateProcessAsUserW = 0x{:X}", create_process_as_user_w);
                 }
                 if nt_create_user_process != 0 {
-                    eprintln!("  NtCreateUserProcess = 0x{:X}", nt_create_user_process);
+                    crate::logln!("  NtCreateUserProcess = 0x{:X}", nt_create_user_process);
                 }
                 // Hide ZwCreateUserProcess if it aliases NtCreateUserProcess
                 // (the common case on modern Windows).
                 if zw_create_user_process != 0 && zw_create_user_process != nt_create_user_process {
-                    eprintln!("  ZwCreateUserProcess = 0x{:X}", zw_create_user_process);
+                    crate::logln!("  ZwCreateUserProcess = 0x{:X}", zw_create_user_process);
                 }
                 self.hook_addrs = Some(HookAddresses {
                     connect: c as u64,
@@ -2212,10 +2846,7 @@ impl DebugTracker {
     fn try_set_all_breakpoints(&mut self) -> bool {
         let addrs: Vec<u64> = match &self.hook_addrs {
             Some(a) => {
-                let mut v = vec![
-                    a.connect,
-                    a.wsaconnect,
-                ];
+                let mut v = vec![a.connect, a.wsaconnect];
                 // Process-creation hooks are optional — only attempt to set
                 // them if their address was successfully resolved AND the
                 // user opted in to child-process tracing.
@@ -2254,6 +2885,12 @@ impl DebugTracker {
     /// LOAD_DLL guarantees we still arm ConnectEx once mswsock appears.
     /// `set_function_breakpoint` is idempotent, so repeat calls are harmless.
     fn try_set_optional_connect_hooks(&mut self) {
+        // Never re-install the optional connect hooks while they are
+        // intentionally disarmed for an open key-extraction window — a DLL load
+        // during that window must not silently re-arm ConnectEx behind our back.
+        if !self.connect_hooks_armed {
+            return;
+        }
         let hooks = match &self.hook_addrs {
             Some(a) => [
                 (a.connect_ex, "ConnectEx"),
@@ -2265,7 +2902,12 @@ impl DebugTracker {
         for (addr, name) in hooks {
             if addr != 0 && !self.breakpoints.contains_key(&addr) {
                 if self.set_function_breakpoint(addr) {
-                    eprintln!("[+] Installed {} hook @ 0x{:X} (PID {})", name, addr, self.pid);
+                    crate::logln!(
+                        "[*] Installed {} hook @ 0x{:X} (PID {})",
+                        name,
+                        addr,
+                        self.pid
+                    );
                 }
             }
         }
@@ -2284,7 +2926,12 @@ impl DebugTracker {
             dbg_log!(self, "[dbg] set_bp 0x{:X}: write failed", address);
             return false;
         }
-        dbg_log!(self, "[dbg] set_bp 0x{:X}: OK (orig=0x{:02X})", address, orig[0]);
+        dbg_log!(
+            self,
+            "[dbg] set_bp 0x{:X}: OK (orig=0x{:02X})",
+            address,
+            orig[0]
+        );
         flush_icache(self.process_handle, address);
         self.breakpoints.insert(
             address,
@@ -2301,8 +2948,13 @@ impl DebugTracker {
         // used by multiple threads/goroutines), append the new call to it.
         if let Some(bp) = self.breakpoints.get_mut(&address) {
             if let BreakpointKind::Return { ref mut calls } = bp.kind {
-                dbg_log!(self, "[dbg] return BP 0x{:X}: appending call for tid={} (now {} calls)",
-                    address, tid, calls.len() + 1);
+                dbg_log!(
+                    self,
+                    "[dbg] return BP 0x{:X}: appending call for tid={} (now {} calls)",
+                    address,
+                    tid,
+                    calls.len() + 1
+                );
                 calls.push((tid, call));
                 return;
             }
@@ -2363,6 +3015,56 @@ impl DebugTracker {
         }
     }
 
+    /// Suspend every thread except `stepper` so the single-step about to be
+    /// armed on `stepper` executes in isolation: while the breakpoint byte is
+    /// restored (the site momentarily un-armed) no other thread can run past
+    /// it. The suspended set is recorded on the stepper's `ThreadState` and
+    /// released by [`Self::resume_step_others`] once its SINGLE_STEP fires (or
+    /// the thread exits). Suspends are OS-counted, so overlapping steps on
+    /// different threads compose correctly.
+    fn suspend_others_for_step(&mut self, stepper: u32) {
+        let others: Vec<u32> = self
+            .thread_handles
+            .keys()
+            .copied()
+            .filter(|&t| t != stepper)
+            .collect();
+        for &t in &others {
+            if let Some(&h) = self.thread_handles.get(&t) {
+                let prev = unsafe { SuspendThread(h) };
+                if prev == u32::MAX {
+                    dbg_log!(self, "[dbg] step-suspend: SuspendThread({}) failed", t);
+                }
+            }
+        }
+        if let Some(ts) = self.threads.get_mut(&stepper) {
+            ts.suspended_others = others;
+        }
+        self.step_in_flight = Some(stepper);
+    }
+
+    /// Resume the threads suspended for `stepper`'s single-step and clear the
+    /// in-flight marker. No-op when none were suspended (e.g. a stray
+    /// single-step, or cleanup for a thread that was not stepping).
+    fn resume_step_others(&mut self, stepper: u32) {
+        let others = self
+            .threads
+            .get_mut(&stepper)
+            .map(|ts| std::mem::take(&mut ts.suspended_others))
+            .unwrap_or_default();
+        for t in others {
+            if let Some(&h) = self.thread_handles.get(&t) {
+                let prev = unsafe { ResumeThread(h) };
+                if prev == u32::MAX {
+                    dbg_log!(self, "[dbg] step-resume: ResumeThread({}) failed", t);
+                }
+            }
+        }
+        if self.step_in_flight == Some(stepper) {
+            self.step_in_flight = None;
+        }
+    }
+
     /// Remove every breakpoint we installed, then detach from the target
     /// without killing it. After this returns the target process is
     /// running normally with all of its original code restored.
@@ -2388,6 +3090,12 @@ impl DebugTracker {
         flush_icache(self.process_handle, 0);
         self.consumed_return_addrs.clear();
         self.scanner.bps.clear();
+        // Release any threads still frozen for an in-flight single-step so the
+        // detached target doesn't continue with a permanently-suspended thread.
+        let steppers: Vec<u32> = self.threads.keys().copied().collect();
+        for s in steppers {
+            self.resume_step_others(s);
+        }
         self.resume_target();
 
         unsafe {
@@ -2395,9 +3103,12 @@ impl DebugTracker {
             // per-debug-object setting and must be requested explicitly.
             let _ = DebugSetProcessKillOnExit(false);
             if let Err(e) = DebugActiveProcessStop(self.pid) {
-                eprintln!("[!] DebugActiveProcessStop({}) failed: {:?}", self.pid, e);
+                crate::logln!("[!] DebugActiveProcessStop({}) failed: {:?}", self.pid, e);
             } else {
-                eprintln!("[+] Detached from PID {} (target continues running)", self.pid);
+                crate::logln!(
+                    "[*] Detached from PID {} (target continues running)",
+                    self.pid
+                );
             }
         }
         self.detached = true;
@@ -2651,7 +3362,6 @@ fn write_redirect_sockaddr(handle: HANDLE, sa_ptr: u64, port: u16) -> bool {
     write_mem(handle, sa_ptr, &sa)
 }
 
-
 pub fn read_mem(handle: HANDLE, addr: u64, buf: &mut [u8]) -> bool {
     let mut n = 0usize;
     unsafe {
@@ -2707,6 +3417,67 @@ fn get_ctx(thread: HANDLE) -> Option<Amd64Context> {
             None
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn set_ctx(thread: HANDLE, ctx: &Amd64Context) -> bool {
+    unsafe { SetThreadContext(thread, ctx).as_bool() }
+}
+
+/// Value of an iced 64-bit GPR (or RIP) in `ctx`. Returns None for registers
+/// we don't model (e.g. 32-bit address-size-override bases), so the caller can
+/// fall back to single-stepping rather than emulate with a wrong address.
+#[cfg(target_arch = "x86_64")]
+fn reg_value(ctx: &Amd64Context, reg: Register) -> Option<u64> {
+    Some(match reg {
+        Register::RAX => ctx.rax,
+        Register::RCX => ctx.rcx,
+        Register::RDX => ctx.rdx,
+        Register::RBX => ctx.rbx,
+        Register::RSP => ctx.rsp,
+        Register::RBP => ctx.rbp,
+        Register::RSI => ctx.rsi,
+        Register::RDI => ctx.rdi,
+        Register::R8 => ctx.r8,
+        Register::R9 => ctx.r9,
+        Register::R10 => ctx.r10,
+        Register::R11 => ctx.r11,
+        Register::R12 => ctx.r12,
+        Register::R13 => ctx.r13,
+        Register::R14 => ctx.r14,
+        Register::R15 => ctx.r15,
+        Register::RIP => ctx.rip,
+        _ => return None,
+    })
+}
+
+/// Effective address of `insn`'s memory operand using register values from
+/// `ctx`: base + index*scale + displacement, or the folded absolute address
+/// for RIP-relative operands. None if a needed register isn't modelled.
+#[cfg(target_arch = "x86_64")]
+fn effective_address(insn: &iced_x86::Instruction, ctx: &Amd64Context) -> Option<u64> {
+    let base = insn.memory_base();
+    // For RIP/EIP-relative operands iced returns the absolute address (it has
+    // already folded in the instruction's next-IP) in the displacement.
+    if base == Register::RIP || base == Register::EIP {
+        return Some(insn.memory_displacement64());
+    }
+    let base_v = if base == Register::None {
+        0
+    } else {
+        reg_value(ctx, base)?
+    };
+    let index = insn.memory_index();
+    let index_v = if index == Register::None {
+        0
+    } else {
+        reg_value(ctx, index)?.wrapping_mul(insn.memory_index_scale() as u64)
+    };
+    Some(
+        base_v
+            .wrapping_add(index_v)
+            .wrapping_add(insn.memory_displacement64()),
+    )
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2779,9 +3550,7 @@ fn read_dll_name(handle: HANDLE, info: &LOAD_DLL_DEBUG_INFO) -> String {
 /// Query size of a module loaded at `base`. Walks VirtualQueryEx regions
 /// until it leaves the MEM_IMAGE allocation identified by AllocationBase.
 fn module_image_size(handle: HANDLE, base: u64) -> u64 {
-    use windows::Win32::System::Memory::{
-        VirtualQueryEx, MEMORY_BASIC_INFORMATION,
-    };
+    use windows::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
     let mut addr = base;
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { mem::zeroed() };
     let sz = mem::size_of::<MEMORY_BASIC_INFORMATION>();
@@ -2880,7 +3649,8 @@ fn sanitize_filename(name: &str) -> String {
 
 /// `CREATE_SUSPENDED` bit for the `dwCreationFlags` argument of the
 /// `CreateProcess*` family.
-const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;/// `THREAD_CREATE_FLAGS_CREATE_SUSPENDED` bit for the `ThreadFlags` argument
+const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;
+/// `THREAD_CREATE_FLAGS_CREATE_SUSPENDED` bit for the `ThreadFlags` argument
 /// of `NtCreateUserProcess` / `ZwCreateUserProcess`.
 const NT_THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
 
@@ -3031,7 +3801,10 @@ fn patch_child_env_placeholder(
         )
     };
     if status != 0 {
-        return Err(format!("NtQueryInformationProcess status=0x{:X}", status as u32));
+        return Err(format!(
+            "NtQueryInformationProcess status=0x{:X}",
+            status as u32
+        ));
     }
     if pbi.peb_base_address == 0 {
         return Err("PEB base address is null".into());
@@ -3080,9 +3853,8 @@ fn patch_child_env_placeholder(
     // The env block is a contiguous sequence of UTF-16 NUL-terminated
     // strings, terminated by an extra UTF-16 NUL.
     let usable = env_buf.len() & !1; // round down to u16 pair
-    let env_u16: &[u16] = unsafe {
-        std::slice::from_raw_parts(env_buf.as_ptr() as *const u16, usable / 2)
-    };
+    let env_u16: &[u16] =
+        unsafe { std::slice::from_raw_parts(env_buf.as_ptr() as *const u16, usable / 2) };
 
     let prefix_w: Vec<u16> = var_prefix.encode_utf16().collect();
     let placeholder_w: Vec<u16> = placeholder.encode_utf16().collect();
@@ -3114,10 +3886,7 @@ fn patch_child_env_placeholder(
     // WriteProcessMemory at the absolute address.
     let write_addr = env_ptr + (placeholder_idx as u64) * 2;
     let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            replacement_w.as_ptr() as *const u8,
-            replacement_w.len() * 2,
-        )
+        std::slice::from_raw_parts(replacement_w.as_ptr() as *const u8, replacement_w.len() * 2)
     };
     let mut written: usize = 0;
     let ok = unsafe {
@@ -3213,7 +3982,9 @@ fn wait_until_debuggable(pid: u32) {
             _ => break,
         }
     }
-    unsafe { let _ = CloseHandle(handle); }
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
 }
 
 // ============================================================================
@@ -3231,6 +4002,7 @@ pub struct TrackerConfig {
     pub max_call_bps: usize,
     pub fallback_scan: bool,
     pub trace_children: bool,
+    pub continuous: bool,
 }
 
 /// Orchestrator that drives a single `WaitForDebugEvent` loop and routes
@@ -3248,7 +4020,10 @@ pub struct MultiTracker {
 
 impl MultiTracker {
     pub fn new(cfg: TrackerConfig) -> Self {
-        Self { cfg, trackers: HashMap::new() }
+        Self {
+            cfg,
+            trackers: HashMap::new(),
+        }
     }
 
     /// Build a fresh `DebugTracker` from this orchestrator's configuration.
@@ -3265,6 +4040,7 @@ impl MultiTracker {
             self.cfg.max_call_bps,
             self.cfg.fallback_scan,
             self.cfg.trace_children,
+            self.cfg.continuous,
             resume_on_attach,
         )
     }
@@ -3273,7 +4049,7 @@ impl MultiTracker {
     /// having called `DebugActiveProcess` or `CreateProcess` with the
     /// `DEBUG_*` flag). Used for the initial CLI-supplied target.
     pub fn add_initial(&mut self, tracker: DebugTracker) {
-        eprintln!("[*] Tracing PID {}", tracker.pid());
+        crate::logln!("[*] Tracing PID {}", tracker.pid());
         self.trackers.insert(tracker.pid(), tracker);
     }
 
@@ -3283,7 +4059,7 @@ impl MultiTracker {
     pub fn attach_child(&mut self, pid: u32) -> std::io::Result<()> {
         DebugTracker::attach(pid)?;
         let tracker = self.make_tracker(pid, /*resume_on_attach=*/ true);
-        eprintln!("[*] Tracing PID {} (child)", pid);
+        crate::logln!("[*] Tracing PID {} (child)", pid);
         self.trackers.insert(pid, tracker);
         Ok(())
     }
@@ -3298,10 +4074,14 @@ impl MultiTracker {
         }
         let pids: Vec<u32> = self.trackers.keys().copied().collect();
         for pid in pids {
-            let done = self.trackers.get(&pid).map(|t| t.is_done()).unwrap_or(false);
+            let done = self
+                .trackers
+                .get(&pid)
+                .map(|t| t.is_done())
+                .unwrap_or(false);
             if done {
                 if let Some(t) = self.trackers.get_mut(&pid) {
-                    eprintln!(
+                    crate::logln!(
                         "[*] Keys captured — unhooking and detaching from PID {}",
                         pid
                     );
@@ -3341,7 +4121,10 @@ impl MultiTracker {
             // a stale event after detach) get a default continuation.
             let outcome = match self.trackers.get_mut(&pid) {
                 Some(t) => t.process_one_event(&event),
-                None => EventOutcome { status: DBG_CONTINUE, finished: false },
+                None => EventOutcome {
+                    status: DBG_CONTINUE,
+                    finished: false,
+                },
             };
 
             unsafe {
@@ -3358,9 +4141,10 @@ impl MultiTracker {
                 .unwrap_or_default();
             for child_pid in pending {
                 if let Err(e) = self.attach_child(child_pid) {
-                    eprintln!(
+                    crate::logln!(
                         "[!] Failed to attach to child PID {}: {} — releasing it",
-                        child_pid, e
+                        child_pid,
+                        e
                     );
                     resume_pid_main_thread(child_pid);
                 }
@@ -3371,7 +4155,7 @@ impl MultiTracker {
             if !remove {
                 if let Some(t) = self.trackers.get_mut(&pid) {
                     if t.is_done() {
-                        eprintln!(
+                        crate::logln!(
                             "[*] Keys captured — unhooking and detaching from PID {}",
                             pid
                         );
@@ -3454,10 +4238,7 @@ fn nudge_then_freeze_child(child_pid: u32) -> bool {
         match OpenProcess(PROCESS_SUSPEND_RESUME, false, child_pid) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!(
-                    "[!] nudge: OpenProcess(PID {}) failed: {:?}",
-                    child_pid, e
-                );
+                crate::logln!("[!] nudge: OpenProcess(PID {}) failed: {:?}", child_pid, e);
                 return false;
             }
         }
@@ -3468,7 +4249,10 @@ fn nudge_then_freeze_child(child_pid: u32) -> bool {
         unsafe {
             let _ = CloseHandle(proc_handle);
         }
-        eprintln!("[!] nudge: could not enumerate threads of PID {}", child_pid);
+        crate::logln!(
+            "[!] nudge: could not enumerate threads of PID {}",
+            child_pid
+        );
         return false;
     }
 
@@ -3477,9 +4261,11 @@ fn nudge_then_freeze_child(child_pid: u32) -> bool {
             Ok(h) => h,
             Err(e) => {
                 let _ = CloseHandle(proc_handle);
-                eprintln!(
+                crate::logln!(
                     "[!] nudge: OpenThread(tid {}) of PID {} failed: {:?}",
-                    tid, child_pid, e
+                    tid,
+                    child_pid,
+                    e
                 );
                 return false;
             }
@@ -3489,9 +4275,7 @@ fn nudge_then_freeze_child(child_pid: u32) -> bool {
     // Boost our priority so the window between ResumeThread and
     // NtSuspendProcess stays microseconds-short.
     let prev_prio = unsafe { GetThreadPriority(GetCurrentThread()) };
-    let _ = unsafe {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)
-    };
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
 
     // Release the suspended primary thread — it begins running ntdll's
     // LdrpInitializeProcess.
@@ -3511,16 +4295,18 @@ fn nudge_then_freeze_child(child_pid: u32) -> bool {
     }
 
     if prev == u32::MAX {
-        eprintln!(
+        crate::logln!(
             "[!] nudge: ResumeThread(tid {}) of PID {} failed",
-            tid, child_pid
+            tid,
+            child_pid
         );
         return false;
     }
     if st < 0 {
-        eprintln!(
+        crate::logln!(
             "[!] nudge: NtSuspendProcess(PID {}) failed: 0x{:08X}",
-            child_pid, st as u32
+            child_pid,
+            st as u32
         );
         return false;
     }

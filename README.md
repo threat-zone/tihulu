@@ -17,6 +17,8 @@ The following entry points are hooked so high-level HTTP stacks are covered as w
 
 The teed byte stream is fed to a TLS parser that tracks the handshake, extracts the **ClientRandom**, **ServerRandom**, and negotiated **cipher suite**, and identifies when application-data records are available for trial decryption. Connections whose first outbound bytes are not a TLS handshake are relayed verbatim and otherwise ignored.
 
+The CALL-probe scanner (below) is armed lazily: rather than arming on every relay connection — which also armed it for plain, non-TLS traffic — Tihulu waits until the first TLS **ClientRandom** is observed. At that point it arms the scanner, disarms all connect hooks, and stops redirecting new connections to the relay until the session's keys are recovered. Once the keys are obtained, behaviour depends on the `-c`/`--continue` flag: by default Tihulu stops after this first session and leaves the connect hooks disarmed; with `-c` it re-arms the connect hooks and resumes intercepting new connections, repeating this cycle until the target process terminates.
+
 Once the handshake is complete, Tihulu attempts to recover the session secret using one of two strategies:
 
 ### 0. `SSLKEYLOGFILE` injection (free side-channel)
@@ -88,6 +90,7 @@ tlsdump [OPTIONS] --pid <PID>
 | `-t <N>`, `--threads <N>` | Threads for memory scan (default: number of CPUs) |
 | `--fallback-scan` | Enable brute-force memory scan if CALL-probe finds nothing |
 | `--no-call-probe` | Skip CALL-probe entirely; use only brute-force scan |
+| `-c`, `--continue` | Keep intercepting new connections after the first session's keys are recovered. Without it, Tihulu stops after the first key search (off by default) |
 | `--trace-children` | Hook CreateProcess and trace any subprocesses spawned by the target (off by default) |
 
 ### Examples
@@ -108,7 +111,12 @@ Attach with verbose output and brute-force fallback enabled:
 tlsdump --pid 1234 --verbose --fallback-scan -w keys\
 ```
 
-Once TLS keys have been recovered, Tihulu unhooks every breakpoint and detaches without terminating the target — the process keeps running normally.
+Continuously capture every TLS session (not just the first), writing keys as they are recovered:
+```powershell
+tlsdump -c -w keys\ -- myapp.exe
+```
+
+By default Tihulu captures a single TLS session: once the first session's keys have been recovered it stops intercepting new connections (the connect hooks are left disarmed) and simply stays attached until the target process exits on its own. Pass `-c`/`--continue` to instead re-arm the connect hooks after each key search and keep intercepting new connections in a cycle until the target terminates.
 
 ## Supported cipher suites
 

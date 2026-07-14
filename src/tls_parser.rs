@@ -130,26 +130,26 @@ impl TlsParser {
                 if handshake_type == SSL_HND_CLIENT_HELLO && record.data.len() >= 38 {
                     self.client_hello_seen = true;
                     self.client_random.copy_from_slice(&record.data[6..38]);
-                    eprintln!("[+] CLIENT RANDOM: {}", hex_string(&self.client_random));
+                    crate::logln!("[+] CLIENT RANDOM: {}", hex_string(&self.client_random));
                 }
 
                 if handshake_type == SSL_HND_SERVER_HELLO && record.data.len() >= 40 {
                     self.server_hello_seen = true;
                     self.server_random.copy_from_slice(&record.data[6..38]);
-                    eprintln!("[+] SERVER RANDOM: {}", hex_string(&self.server_random));
+                    crate::logln!("[+] SERVER RANDOM: {}", hex_string(&self.server_random));
 
                     let session_id_length = record.data[38] as usize;
                     if record.data.len() > 38 + session_id_length + 2 {
                         self.cipher_suite_id = ((record.data[38 + session_id_length + 1] as u16) << 8)
                             | (record.data[38 + session_id_length + 2] as u16);
-                        eprintln!("[*] CIPHER SUITE: 0x{:04X}", self.cipher_suite_id);
+                        crate::logln!("[*] CIPHER SUITE: 0x{:04X}", self.cipher_suite_id);
                         self.cipher_suite = find_cipher_suite(self.cipher_suite_id);
                         self.cipher_suite_set = self.cipher_suite.is_some();
 
                         if let Some(cs) = self.cipher_suite {
                             if cs.is_tls13() {
                                 self.is_tls13 = true;
-                                eprintln!("[*] TLS 1.3 detected");
+                                crate::logln!("[*] TLS 1.3 detected");
                             }
                         }
                     }
@@ -161,20 +161,20 @@ impl TlsParser {
                         Direction::Out => {
                             if self.tls13_out_app_count == 0 {
                                 self.tls13_client_finished = Some(record.clone());
-                                eprintln!("[*] [TLS-1.3] captured client finished record ({} bytes)", record.length);
+                                crate::logln!("[*] [TLS-1.3] captured client finished record ({} bytes)", record.length);
                             } else if self.tls13_out_app_count == 1 {
                                 self.tls13_client_app_data = Some(record.clone());
-                                eprintln!("[*] [TLS-1.3] captured client application data record ({} bytes)", record.length);
+                                crate::logln!("[*] [TLS-1.3] captured client application data record ({} bytes)", record.length);
                             }
                             self.tls13_out_app_count += 1;
                         }
                         Direction::In => {
                             if self.tls13_in_app_count == 0 {
                                 self.tls13_server_encrypted = Some(record.clone());
-                                eprintln!("[*] [TLS-1.3] captured server encrypted handshake record ({} bytes)", record.length);
+                                crate::logln!("[*] [TLS-1.3] captured server encrypted handshake record ({} bytes)", record.length);
                             } else if self.tls13_server_app_data.is_none() {
                                 self.tls13_server_app_data = Some(record.clone());
-                                eprintln!("[*] [TLS-1.3] captured server application data record ({} bytes)", record.length);
+                                crate::logln!("[*] [TLS-1.3] captured server application data record ({} bytes)", record.length);
                             }
                             self.tls13_in_app_count += 1;
                         }

@@ -128,7 +128,7 @@ fn relay_connection(
         Some(s) => s,
         None => {
             if verbose {
-                eprintln!("[dbg] relay {}: target never connected", conn_id);
+                crate::logln!("[dbg] relay {}: target never connected", conn_id);
             }
             let _ = tx.send(ProxyEvent::Closed { conn_id });
             return;
@@ -139,7 +139,7 @@ fn relay_connection(
     let outbound = match TcpStream::connect_timeout(&dest, UPSTREAM_TIMEOUT) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            crate::logln!(
                 "[!] relay {}: upstream connect to {} failed: {}",
                 conn_id, dest, e
             );
